@@ -1,0 +1,37 @@
+# Python bytecode / caches
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables / secrets
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model / adapter artifacts and training outputs
+*.safetensors
+*.bin
+outputs/
+checkpoints/
+adapters/
+wandb/
+
+# Synthetic training data (regenerable, not checked in by default)
+data/synthetic/*.jsonl
+
+# Keep the real hand-labeled eval set trackable
+!data/eval/*.jsonl
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

@@ -52,20 +52,52 @@ HF Hub; template and precedent: `paraloq/json_data_extraction` — English, Gemi
 - **Authenticity:** the README and HF model card **openly state** that the training data is LLM-generated
   (following the `paraloq` precedent). See the `cv-only-authentic-claims` principle in the dev plan.
 
+## Structured decoding vs. fine-tuning (why both, and what fine-tuning actually proves)
+
+These solve **different layers** and are complementary, not competitors:
+
+| | Structured decoding | Fine-tuning (LoRA/QLoRA) |
+|---|---|---|
+| Guarantees | **Format** — output is parseable, schema-valid JSON | **Content** — the model extracts the *correct* value |
+| How | Masks schema-violating tokens at generation time | Trains the weights on the task |
+| Cost | Zero training, zero labeled data | GPU + labeled data |
+| Cannot do | Wraps a *wrong* value in valid JSON too | (does not itself guarantee format) |
+
+Structured decoding makes the JSON **valid**, not **correct**. So "fine-tune to get valid JSON" would be a
+weak motivation — guided decoding does that for free. This project therefore positions fine-tuning around
+the part structured decoding **cannot** fix: **content accuracy**. To isolate that cleanly, the eval
+applies **structured decoding to BOTH the base and the fine-tuned model**, so format is controlled for and
+the measured delta is purely the extraction-accuracy gain.
+
+**Portfolio narrative (2×2 comparison, goes in the README):**
+
+| | Prompt-only | + Structured decoding |
+|---|---|---|
+| **Base model** | baseline (format + content both weak) | valid JSON, content still weak |
+| **Fine-tuned** | better content, format may still slip | **best** — valid JSON *and* accurate content |
+
+This demonstrates understanding of *where each technique helps* — a stronger signal than a naive
+"teach the model JSON" framing.
+
 ## Success metric (before/after)
 
-Compare the base (pre-fine-tuning) model vs. the LoRA-adapter model on the **real eval set**:
+Compare the base (pre-fine-tuning) model vs. the LoRA-adapter model on the **real eval set**, with
+**structured decoding enabled for both** (format controlled for):
 
-1. **JSON validity rate** — is the output parseable (syntactic correctness)?
-2. **Per-field exact-match F1** — the fraction of correctly extracted fields vs. the gold JSON.
+1. **Per-field exact-match F1** (primary) — the fraction of correctly extracted fields vs. the gold JSON.
+   This is the content-accuracy gain fine-tuning is responsible for.
+2. **JSON validity rate** (secondary, prompt-only variant) — reported *without* structured decoding, to
+   show the fine-tuning also improves raw format adherence (and to motivate the 2×2 above).
 
-Expectation: a measurable, reportable improvement in both metrics. Results table goes into the README.
+Expectation: a measurable, reportable improvement in per-field F1. Results table (the 2×2) goes into the README.
 
 ## Environment / stack
 
 - **Training:** Google **Colab** (free **T4 16GB** is enough for E2B; L4/A100 optional for speed).
 - **Framework:** **Unsloth** (wraps `torch`, `transformers`, `peft`, `trl`, `bitsandbytes`, `accelerate`,
   `datasets`), **QLoRA** (4-bit NF4), `LoraConfig` around r=16.
+- **Structured decoding (eval):** `outlines` (or `transformers` logits processor) to enforce the JSON
+  schema at generation time — applied to base *and* fine-tuned during eval to control for format.
 - **Adapter hosting:** **Hugging Face Hub** (with a model card — step 3.7).
 
 ## Out of scope

@@ -1,0 +1,14 @@
+# On Google Colab, the usual workflow is simply `pip install unsloth`, which
+# transitively pulls in a compatible torch/transformers/peft/trl/bitsandbytes/
+# accelerate/datasets stack tuned for the Colab CUDA runtime.
+#
+# This file pins the *direct* dependencies of this repo for local/reproducible
+# use outside of Colab. Version numbers are intentionally left unpinned since
+# Colab manages the torch/CUDA-compatible versions itself; pin them locally if
+# you need a fully reproducible environment.
+
+unsloth          # QLoRA fine-tuning framework (wraps torch/transformers/peft/trl/bitsandbytes/accelerate)
+datasets         # Hugging Face Datasets, for loading/writing the synthetic and eval JSONL data
+outlines         # structured (schema-constrained) decoding, applied to base + fine-tuned during eval
+huggingface_hub  # pushing/pulling the trained LoRA adapter to/from the Hugging Face Hub
+python-dotenv    # loads API keys (e.g. for the synthetic-data generator) from a local .env file
