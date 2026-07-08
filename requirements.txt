@@ -12,3 +12,5 @@ datasets         # Hugging Face Datasets, for loading/writing the synthetic and 
 outlines         # structured (schema-constrained) decoding, applied to base + fine-tuned during eval
 huggingface_hub  # pushing/pulling the trained LoRA adapter to/from the Hugging Face Hub
 python-dotenv    # loads API keys (e.g. for the synthetic-data generator) from a local .env file
+google-genai     # official Google Gen AI SDK, used to call Gemini for synthetic data generation
+jsonschema       # validates generated gold JSON (and later, model predictions) against the domain schemas
