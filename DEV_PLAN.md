@@ -15,7 +15,7 @@
   **Unsloth base** (`unsloth` transitively pulls in `torch`, `transformers`, `peft`, `trl`,
   `bitsandbytes`, `accelerate`, `datasets`), `.gitignore`, MIT license (for the own code), empty
   `README`. Training environment: **Google Colab** (not RunPod).
-- [~] **3.3** Synthetic data generator (`src/generate_data.py`, `src/schemas.py`): calls an
+- [x] **3.3** Synthetic data generator (`src/generate_data.py`, `src/schemas.py`): calls an
   OpenAI-compatible **local proxy serving Claude models** (`claude-haiku-4-5-20251001`, own
   resource — no employer/client keys) to generate `{Hungarian document → gold JSON}` pairs across
   the 3 domains, with a schema-driven prompt + local `jsonschema` validation and retry/backoff.
