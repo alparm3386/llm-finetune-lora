@@ -108,7 +108,7 @@ integration is non-trivial):
   `schemas.py`. The **hand-labeling itself is manual work (owner: user)**, a
   few dozen docs/domain — tracked as its own checklist item, unblocked by this
   scaffolding.
-- [ ] **3.5.1** **`Opus`** — `src/eval_metrics.py`: `normalize_value`, scalar &
+- [x] **3.5.1** **`Opus`** — `src/eval_metrics.py`: `normalize_value`, scalar &
   array TP/FP/FN classification (per decision A), micro-F1 aggregation
   (overall/per-domain/per-field), `is_valid_json` / schema-validity check. Pure
   functions, no model deps.
