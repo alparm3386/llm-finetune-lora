@@ -57,7 +57,9 @@
   epochs/steps, resume-from-checkpoint. `main()` wires the full pipeline
   (load → LoRA → dataset → trainer → train → save); `--out` holds both the
   final adapter and `<out>/checkpoints`.
-- [ ] **3.4.6** `Sonnet` — `notebooks/train_colab.ipynb`: thin Colab wrapper.
+- [x] **3.4.6** `Sonnet` — `notebooks/train_colab.ipynb`: thin Colab wrapper.
+  `pip install unsloth` → clone repo → upload `data/synthetic/*.jsonl` (gitignored,
+  doesn't come with the clone) → `--smoke` → full run → download adapter.
 - [ ] **3.4.7** `Sonnet` — Local sanity: unit-test the non-GPU parts (format +
   data loading). Full GPU run is 3.6.
 
