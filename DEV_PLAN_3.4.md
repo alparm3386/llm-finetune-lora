@@ -49,8 +49,10 @@
   gradient checkpointing). Uses `finetune_*_layers` flags (vision frozen,
   text-only) instead of a raw `target_modules` list; `unsloth` imported lazily
   so the module stays importable without CUDA.
-- [ ] **3.4.4** **`Opus`** — `SFTTrainer`/`SFTConfig` (trl via Unsloth), T4-tuned
-  args, `train_on_responses_only`, checkpointing + save adapter.
+- [x] **3.4.4** **`Opus`** — `SFTTrainer`/`SFTConfig` (trl via Unsloth), T4-tuned
+  args, `train_on_responses_only`, checkpointing + save adapter. `build_trainer`
+  (max_steps overrides epochs for `--smoke`; packing off; bf16 auto-detect for
+  optional L4/A100) + `save_adapter` (adapter-only). trl/unsloth imported lazily.
 - [ ] **3.4.5** `Sonnet` — CLI/config: argparse, `--smoke`, seeds, `--out`,
   epochs/steps, resume-from-checkpoint.
 - [ ] **3.4.6** `Sonnet` — `notebooks/train_colab.ipynb`: thin Colab wrapper.

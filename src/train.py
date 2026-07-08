@@ -45,6 +45,37 @@ LORA_R = 16
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.0
 
+# T4-tuned training hyperparameters (locked decision E). Effective batch size
+# is 2 x 4 = 8. `adamw_8bit` + gradient checkpointing keep the E2B QLoRA run
+# inside the T4's 16 GB. LR 2e-4 with a cosine schedule is the Unsloth default
+# for LoRA SFT.
+LEARNING_RATE = 2e-4
+PER_DEVICE_TRAIN_BATCH_SIZE = 2
+GRAD_ACCUM_STEPS = 4
+NUM_TRAIN_EPOCHS = 3
+WARMUP_RATIO = 0.03
+WEIGHT_DECAY = 0.01
+LR_SCHEDULER_TYPE = "cosine"
+OPTIMIZER = "adamw_8bit"
+LOGGING_STEPS = 1
+# eval/checkpoint cadence; the synthetic train set is small (~430 ex -> ~160
+# steps over 3 epochs at effective batch 8), so every 20 steps is a few times
+# per epoch. `save_total_limit` caps Colab disk use.
+EVAL_STEPS = 20
+SAVE_STEPS = 20
+SAVE_TOTAL_LIMIT = 2
+
+# `--smoke` step budget: the "runnable at a few hundred steps" config from the
+# plan, for a quick end-to-end shakeout rather than a full training run.
+SMOKE_MAX_STEPS = 60
+
+# Gemma chat-template turn markers for `train_on_responses_only`: loss is
+# computed only on the model's completion (the gold JSON), with the user turn
+# (instruction + schema + document) masked to -100. These exact strings are
+# required for Gemma 2/3/3n/4 or masking silently zeroes every label.
+GEMMA_INSTRUCTION_PART = "<start_of_turn>user\n"
+GEMMA_RESPONSE_PART = "<start_of_turn>model\n"
+
 
 def load_examples(data_dir: Path) -> list[dict[str, Any]]:
     """Read all per-domain synthetic JSONL files into a single list of examples."""
@@ -138,6 +169,87 @@ def add_lora_adapter(model: Any, seed: int) -> Any:
         use_rslora=False,
         loftq_config=None,
     )
+
+
+def build_trainer(
+    model: Any,
+    tokenizer: Any,
+    train_dataset: Dataset,
+    val_dataset: Dataset,
+    output_dir: str,
+    seed: int,
+    max_seq_length: int = MAX_SEQ_LENGTH,
+    num_train_epochs: int = NUM_TRAIN_EPOCHS,
+    max_steps: int | None = None,
+) -> Any:
+    """Build the trl `SFTTrainer`, tuned for a Colab T4 and masked to responses.
+
+    `max_steps`, when given (e.g. `--smoke`), overrides `num_train_epochs`. The
+    trainer is wrapped with `train_on_responses_only` so loss is computed only
+    on the gold-JSON completion, not the prompt (locked decision C).
+
+    `unsloth` / `trl` are imported lazily so the module stays importable without
+    CUDA (see `load_base_model`).
+    """
+    from trl import SFTConfig, SFTTrainer
+    from unsloth import is_bfloat16_supported
+    from unsloth.chat_templates import train_on_responses_only
+
+    # -1 tells trl to ignore max_steps and train for the full epoch count.
+    effective_max_steps = max_steps if max_steps is not None else -1
+
+    config = SFTConfig(
+        dataset_text_field="text",
+        max_seq_length=max_seq_length,
+        packing=False,  # incompatible with response-only masking
+        per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+        warmup_ratio=WARMUP_RATIO,
+        num_train_epochs=num_train_epochs,
+        max_steps=effective_max_steps,
+        learning_rate=LEARNING_RATE,
+        # T4 has no bf16; `is_bfloat16_supported()` keeps this correct on the
+        # optional L4/A100 too (SCOPE.md) instead of hardcoding fp16.
+        fp16=not is_bfloat16_supported(),
+        bf16=is_bfloat16_supported(),
+        optim=OPTIMIZER,
+        weight_decay=WEIGHT_DECAY,
+        lr_scheduler_type=LR_SCHEDULER_TYPE,
+        logging_steps=LOGGING_STEPS,
+        eval_strategy="steps",
+        eval_steps=EVAL_STEPS,
+        save_strategy="steps",
+        save_steps=SAVE_STEPS,
+        save_total_limit=SAVE_TOTAL_LIMIT,
+        seed=seed,
+        output_dir=output_dir,
+        report_to="none",
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        args=config,
+    )
+
+    return train_on_responses_only(
+        trainer,
+        instruction_part=GEMMA_INSTRUCTION_PART,
+        response_part=GEMMA_RESPONSE_PART,
+    )
+
+
+def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
+    """Save the trained LoRA adapter + tokenizer (not the merged base weights).
+
+    Only the adapter is saved — `evaluate.py` (3.5) loads the base model and
+    attaches this adapter, and the HF Hub upload (3.7) publishes just the
+    adapter, mirroring how it will be consumed.
+    """
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
 
 def main() -> None:
