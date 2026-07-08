@@ -1,18 +1,19 @@
 """QLoRA fine-tuning of Gemma 4 E2B with Unsloth.
 
-This module will run the actual fine-tuning job: load the base model in
-4-bit (QLoRA) via Unsloth, attach a LoRA adapter, and train it on the
-synthetic text-to-JSON dataset produced by `generate_data.py`. Intended to
-run on a Google Colab T4 instance.
+This module runs the actual fine-tuning job: load the base model in 4-bit
+(QLoRA) via Unsloth, attach a LoRA adapter, and train it on the synthetic
+text-to-JSON dataset produced by `generate_data.py`. Intended to run on a
+Google Colab T4 instance (see `notebooks/train_colab.ipynb`, step 3.4.6).
 
-# TODO (3.4):
-#   - Train with an SFTTrainer (trl), tuned for a single Colab T4 GPU.
-#   - Save the resulting LoRA adapter (and optionally push it to the Hugging Face Hub).
+Pushing the trained adapter to the Hugging Face Hub is a separate step (3.7);
+this script only saves it locally.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,14 @@ from datasets import Dataset
 from prompt_format import to_chat_messages
 from schemas import SCHEMAS
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
+
 DOMAINS = tuple(SCHEMAS)
+
+# Default RNG seed for the data split, LoRA init, and trainer — matches
+# Unsloth's conventional `random_state = 3407`.
+DEFAULT_SEED = 3407
 
 # Fraction of the synthetic data held out for `eval_loss` monitoring during
 # training. The *real* before/after eval (3.5) uses a separate, hand-labeled
@@ -252,8 +260,105 @@ def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
     tokenizer.save_pretrained(output_dir)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "QLoRA fine-tune Gemma 4 E2B on the synthetic Hungarian text-to-JSON "
+            "extraction data. Designed for a Colab T4."
+        )
+    )
+    parser.add_argument(
+        "--data-dir",
+        default="data/synthetic",
+        help="Directory of per-domain synthetic JSONL files (default: data/synthetic).",
+    )
+    parser.add_argument(
+        "--out",
+        default="outputs",
+        help=(
+            "Output directory: the final LoRA adapter is saved here, and "
+            "training checkpoints go under <out>/checkpoints (default: outputs)."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL_NAME,
+        help=f"Base model to load (default: {DEFAULT_MODEL_NAME}).",
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=MAX_SEQ_LENGTH,
+        help=f"Max sequence length (default: {MAX_SEQ_LENGTH}).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=NUM_TRAIN_EPOCHS,
+        help=f"Number of training epochs (default: {NUM_TRAIN_EPOCHS}); ignored if --max-steps/--smoke set.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Cap training at this many steps, overriding --epochs (default: none).",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help=f"Quick end-to-end shakeout: caps training at {SMOKE_MAX_STEPS} steps (unless --max-steps is given).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=DEFAULT_SEED, help=f"Random seed (default: {DEFAULT_SEED})."
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        nargs="?",
+        const=True,
+        default=None,
+        help=(
+            "Resume training. Bare flag resumes from the latest checkpoint in "
+            "<out>/checkpoints; pass a path to resume from a specific one."
+        ),
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    raise NotImplementedError("Step 3.4: QLoRA training not yet implemented")
+    args = parse_args()
+
+    # --max-steps wins; else --smoke uses the smoke budget; else full epochs.
+    max_steps = args.max_steps
+    if max_steps is None and args.smoke:
+        max_steps = SMOKE_MAX_STEPS
+
+    logger.info("Loading base model %s (4-bit QLoRA)...", args.model)
+    model, tokenizer = load_base_model(args.model, args.max_seq_length)
+    model = add_lora_adapter(model, args.seed)
+
+    logger.info("Building dataset from %s...", args.data_dir)
+    train_ds, val_ds = build_dataset(Path(args.data_dir), tokenizer, args.seed)
+    logger.info("Train: %d examples, val: %d examples", len(train_ds), len(val_ds))
+
+    checkpoint_dir = str(Path(args.out) / "checkpoints")
+    trainer = build_trainer(
+        model,
+        tokenizer,
+        train_ds,
+        val_ds,
+        output_dir=checkpoint_dir,
+        seed=args.seed,
+        max_seq_length=args.max_seq_length,
+        num_train_epochs=args.epochs,
+        max_steps=max_steps,
+    )
+
+    logger.info("Starting training%s...", " (smoke)" if max_steps == SMOKE_MAX_STEPS else "")
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+
+    logger.info("Saving LoRA adapter to %s...", args.out)
+    save_adapter(model, tokenizer, args.out)
+    logger.info("Done.")
 
 
 if __name__ == "__main__":

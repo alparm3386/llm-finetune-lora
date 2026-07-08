@@ -53,8 +53,10 @@
   args, `train_on_responses_only`, checkpointing + save adapter. `build_trainer`
   (max_steps overrides epochs for `--smoke`; packing off; bf16 auto-detect for
   optional L4/A100) + `save_adapter` (adapter-only). trl/unsloth imported lazily.
-- [ ] **3.4.5** `Sonnet` — CLI/config: argparse, `--smoke`, seeds, `--out`,
-  epochs/steps, resume-from-checkpoint.
+- [x] **3.4.5** `Sonnet` — CLI/config: argparse, `--smoke`, seeds, `--out`,
+  epochs/steps, resume-from-checkpoint. `main()` wires the full pipeline
+  (load → LoRA → dataset → trainer → train → save); `--out` holds both the
+  final adapter and `<out>/checkpoints`.
 - [ ] **3.4.6** `Sonnet` — `notebooks/train_colab.ipynb`: thin Colab wrapper.
 - [ ] **3.4.7** `Sonnet` — Local sanity: unit-test the non-GPU parts (format +
   data loading). Full GPU run is 3.6.
