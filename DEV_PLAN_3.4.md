@@ -42,11 +42,13 @@
 - [x] **3.4.1** `Sonnet` — `src/prompt_format.py`: `build_prompt(domain, document)`,
   `serialize_gold(gold, domain)` (deterministic, schema key order, `ensure_ascii=False`),
   `to_chat_messages(...)`. Reuses `schemas.py`.
-- [ ] **3.4.2** `Sonnet` — Data loading in `train.py`: read 3 JSONL → HF `Dataset`,
+- [x] **3.4.2** `Sonnet` — Data loading in `train.py`: read 3 JSONL → HF `Dataset`,
   map to Gemma-chat-formatted text, seeded train/val split.
-- [ ] **3.4.3** **`Opus`** — Model + LoRA: Unsloth `FastModel` load
+- [x] **3.4.3** **`Opus`** — Model + LoRA: Unsloth `FastModel` load
   `google/gemma-4-E2B` 4-bit; `get_peft_model` (target modules, r/alpha/dropout,
-  gradient checkpointing).
+  gradient checkpointing). Uses `finetune_*_layers` flags (vision frozen,
+  text-only) instead of a raw `target_modules` list; `unsloth` imported lazily
+  so the module stays importable without CUDA.
 - [ ] **3.4.4** **`Opus`** — `SFTTrainer`/`SFTConfig` (trl via Unsloth), T4-tuned
   args, `train_on_responses_only`, checkpointing + save adapter.
 - [ ] **3.4.5** `Sonnet` — CLI/config: argparse, `--smoke`, seeds, `--out`,
