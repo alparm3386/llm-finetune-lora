@@ -40,7 +40,7 @@ DOMAINS = ("medical", "business", "technology")
 # by the user — no API key required). Keeps one persistent Claude Agent SDK
 # connection open across requests instead of spawning a fresh CLI session per
 # call, which is dramatically faster for a batch of independent completions.
-LOCAL_PROXY_BASE_URL = "http://127.0.0.1:8001/v1"
+LOCAL_PROXY_BASE_URL = "http://127.0.0.1:8000/v1"
 LOCAL_PROXY_PLACEHOLDER_API_KEY = "not-needed"
 
 # claude-fast-proxy disables extended thinking outright, so max_tokens isn't
