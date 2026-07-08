@@ -26,6 +26,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from jsonschema import ValidationError, validate
 
@@ -63,6 +64,11 @@ STYLE_HINTS: dict[str, list[str]] = {
 }
 
 GENERATION_TEMPERATURE_RANGE = (0.7, 1.0)
+
+# Backoff (seconds) between retries. Validation/parse retries can be quick;
+# transient API errors (503/429) need more breathing room, capped at 60s.
+VALIDATION_BACKOFF_CAP = 30.0
+API_BACKOFF_CAP = 60.0
 
 
 def _describe_field(name: str, spec: dict[str, Any]) -> str:
@@ -163,8 +169,13 @@ def generate_one_example(
 ) -> dict[str, Any] | None:
     """Generate and validate a single {document, gold} example for a domain.
 
-    Retries up to `max_retries` times (with exponential backoff) on parse or
-    schema-validation failure. Returns None if all attempts fail.
+    Retries up to `max_retries` times (with exponential backoff) on:
+      - parse/validation failures (bad JSON or schema-invalid gold), and
+      - transient API errors: any 5xx ``ServerError``, and 429 rate-limit
+        ``ClientError``.
+    Non-transient client errors (other 4xx, e.g. 400/401/403 — bad request,
+    bad key, forbidden) are NOT transient and abort immediately with a clear
+    message. Returns None if all retries are exhausted.
     """
     domain_schema = SCHEMAS[domain]
     style_hint = rng.choice(STYLE_HINTS[domain])
@@ -188,6 +199,29 @@ def generate_one_example(
                 raise ValueError("empty or non-string 'document' field")
             validate(instance=gold, schema=domain_schema)
             return {"domain": domain, "document": document, "gold": gold}
+        except genai_errors.ClientError as exc:
+            # 429 = rate limit -> transient, retry. Any other 4xx is our bug
+            # (bad request / bad key / forbidden) -> fail fast.
+            if exc.code != 429:
+                raise SystemExit(
+                    f"Non-retryable API error (HTTP {exc.code}): {exc}. "
+                    "This is likely a bad request or an invalid/unauthorized "
+                    "GEMINI_API_KEY, not a transient outage."
+                ) from exc
+            logger.warning(
+                "[%s] attempt %d/%d rate-limited (429): %s",
+                domain, attempt, max_retries, exc,
+            )
+            if attempt < max_retries:
+                time.sleep(min(5 * 2 ** (attempt - 1), API_BACKOFF_CAP))
+        except genai_errors.ServerError as exc:
+            # 5xx (e.g. 503 UNAVAILABLE, 500) -> transient, always retry.
+            logger.warning(
+                "[%s] attempt %d/%d server error (%s): %s",
+                domain, attempt, max_retries, exc.code, exc,
+            )
+            if attempt < max_retries:
+                time.sleep(min(5 * 2 ** (attempt - 1), API_BACKOFF_CAP))
         except (
             json.JSONDecodeError,
             KeyError,
@@ -198,7 +232,7 @@ def generate_one_example(
                 "[%s] attempt %d/%d failed: %s", domain, attempt, max_retries, exc
             )
             if attempt < max_retries:
-                time.sleep(2 ** (attempt - 1))
+                time.sleep(min(2 ** (attempt - 1), VALIDATION_BACKOFF_CAP))
     return None
 
 
@@ -210,6 +244,7 @@ def generate_domain(
     rng: random.Random,
     max_retries: int,
     out_dir: Path,
+    delay: float,
 ) -> int:
     """Generate `n` examples for one domain, writing valid ones to JSONL.
 
@@ -226,6 +261,10 @@ def generate_domain(
                 continue
             f.write(json.dumps(example, ensure_ascii=False) + "\n")
             logger.info("[%s] %d/%d", domain, i, n)
+            # Polite delay between successful requests to avoid tripping
+            # free-tier rate limits.
+            if delay > 0:
+                time.sleep(delay)
     return skipped
 
 
@@ -254,8 +293,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-retries",
         type=int,
-        default=3,
-        help="Max generation attempts per example before skipping it (default: 3).",
+        default=5,
+        help="Max generation attempts per example before skipping it (default: 5).",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.5,
+        help="Delay (seconds) after each successful request, to avoid rate limits (default: 0.5).",
     )
     return parser.parse_args()
 
@@ -280,7 +325,7 @@ def main() -> None:
     total_skipped = 0
     for domain in domains:
         skipped = generate_domain(
-            client, domain, args.n, args.model, rng, args.max_retries, out_dir
+            client, domain, args.n, args.model, rng, args.max_retries, out_dir, args.delay
         )
         total_skipped += skipped
         logger.info("[%s] done: %d generated, %d skipped", domain, args.n - skipped, skipped)
