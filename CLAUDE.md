@@ -16,7 +16,7 @@ dev-plan steps 3.4 and 3.5.
 
 ```bash
 pip install -r requirements.txt        # local/reproducible deps; on Colab, `pip install unsloth` instead
-python src/generate_data.py --domain all --n 50   # generate synthetic training data via Gemini
+python src/generate_data.py --domain all --n 50   # generate synthetic training data via the local proxy
 python src/generate_data.py --domain medical --n 20 --seed 1  # single domain, custom count/seed
 python src/train.py                    # QLoRA fine-tuning (stub — step 3.4)
 python src/evaluate.py                 # before/after eval (stub — step 3.5)
@@ -24,8 +24,9 @@ python src/evaluate.py                 # before/after eval (stub — step 3.5)
 
 No test suite, linter, or CI config exists yet.
 
-`generate_data.py` requires `GEMINI_API_KEY` in a local `.env` (copy `.env.example` — never commit
-the real `.env`, it's gitignored).
+`generate_data.py` calls an OpenAI-compatible local proxy (serving Claude models) at
+`http://127.0.0.1:8000/v1` — no API key needed (a placeholder string is passed to satisfy the SDK).
+The proxy must be running locally before invoking the script.
 
 ## Architecture
 
@@ -33,10 +34,12 @@ the real `.env`, it's gitignored).
   business, technology), mirroring the tables in `SCOPE.md`. Both `generate_data.py` (validates
   synthetic gold JSON) and the future `evaluate.py`/structured-decoding step consume `SCHEMAS`
   from here. If a domain schema changes, it only needs to change in this file.
-- **`src/generate_data.py`** — calls Gemini to synthesize `{document, gold}` pairs per domain,
-  validates each `gold` against `schemas.py`, retries on failure, writes JSONL to
-  `data/synthetic/{domain}.jsonl`. Style variation comes from rotating `STYLE_HINTS` per domain
-  rather than a single fixed prompt, to avoid repetitive generations.
+- **`src/generate_data.py`** — calls a local OpenAI-compatible proxy (serving Claude models) to
+  synthesize `{document, gold}` pairs per domain, validates each `gold` against `schemas.py`,
+  retries on failure, writes JSONL to `data/synthetic/{domain}.jsonl`. Style variation comes from
+  rotating `STYLE_HINTS`/`NAME_STYLE_HINTS` per domain rather than a single fixed prompt, to avoid
+  repetitive generations (entity names, tone, and nullable-field presence are all varied
+  deterministically in code, not left purely to the model).
 - **`src/train.py`** — will load the base model in 4-bit via Unsloth, attach a LoRA adapter
   (r≈16), and fine-tune on `data/synthetic/`. Target environment: Colab T4.
 - **`src/evaluate.py`** — will run the before/after comparison. Key design point from `SCOPE.md`:
