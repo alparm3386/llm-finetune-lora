@@ -39,8 +39,8 @@
 
 ## Sub-steps
 
-- [ ] **3.4.1** `Sonnet` — `src/prompt_format.py`: `build_prompt(domain, document)`,
-  `serialize_gold(gold)` (deterministic, schema key order, `ensure_ascii=False`),
+- [x] **3.4.1** `Sonnet` — `src/prompt_format.py`: `build_prompt(domain, document)`,
+  `serialize_gold(gold, domain)` (deterministic, schema key order, `ensure_ascii=False`),
   `to_chat_messages(...)`. Reuses `schemas.py`.
 - [ ] **3.4.2** `Sonnet` — Data loading in `train.py`: read 3 JSONL → HF `Dataset`,
   map to Gemma-chat-formatted text, seeded train/val split.
