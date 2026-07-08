@@ -13,3 +13,4 @@ outlines         # structured (schema-constrained) decoding, applied to base + f
 huggingface_hub  # pushing/pulling the trained LoRA adapter to/from the Hugging Face Hub
 openai           # OpenAI-compatible client, used to call the local proxy (serving Claude models) for synthetic data generation
 jsonschema       # validates generated gold JSON (and later, model predictions) against the domain schemas
+pytest           # local unit tests for the non-GPU parts (prompt_format.py, train.py data pipeline/CLI)

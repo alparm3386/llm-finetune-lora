@@ -9,8 +9,8 @@ QLoRA fine-tuning of `google/gemma-4-E2B` (Instruct) for Hungarian structured ex
 rationale, dataset design, and success metric are defined in `SCOPE.md` — read it before making
 design decisions; don't duplicate its content into code comments.
 
-Status: work in progress. `train.py` and `evaluate.py` are stubs (`NotImplementedError`) awaiting
-dev-plan steps 3.4 and 3.5.
+Status: work in progress. `train.py` (step 3.4) is implemented but unrun — the actual GPU training
+job is step 3.6 (Colab T4). `evaluate.py` is a stub (`NotImplementedError`) awaiting step 3.5.
 
 ## Commands
 
@@ -18,11 +18,13 @@ dev-plan steps 3.4 and 3.5.
 pip install -r requirements.txt        # local/reproducible deps; on Colab, `pip install unsloth` instead
 python src/generate_data.py --domain all --n 50   # generate synthetic training data via the local proxy
 python src/generate_data.py --domain medical --n 20 --seed 1  # single domain, custom count/seed
-python src/train.py                    # QLoRA fine-tuning (stub — step 3.4)
+python src/train.py --smoke            # QLoRA fine-tuning; only runs on a CUDA GPU (Colab T4, step 3.6)
 python src/evaluate.py                 # before/after eval (stub — step 3.5)
+pytest                                 # unit tests for the non-GPU parts (prompt_format.py, train.py data/CLI)
 ```
 
-No test suite, linter, or CI config exists yet.
+No linter or CI config exists yet. `pytest.ini` adds `src/` to the path so tests can import its
+modules directly (e.g. `from train import ...`), matching how the scripts import each other.
 
 `generate_data.py` calls an OpenAI-compatible local proxy (serving Claude models) at
 `http://127.0.0.1:8000/v1` — no API key needed (a placeholder string is passed to satisfy the SDK).
@@ -40,8 +42,13 @@ The proxy must be running locally before invoking the script.
   rotating `STYLE_HINTS`/`NAME_STYLE_HINTS` per domain rather than a single fixed prompt, to avoid
   repetitive generations (entity names, tone, and nullable-field presence are all varied
   deterministically in code, not left purely to the model).
-- **`src/train.py`** — will load the base model in 4-bit via Unsloth, attach a LoRA adapter
-  (r≈16), and fine-tune on `data/synthetic/`. Target environment: Colab T4.
+- **`src/train.py`** — loads the base model in 4-bit via Unsloth (`load_base_model`), attaches a
+  LoRA adapter (`add_lora_adapter`, r=16, text-only via `finetune_*_layers` flags), builds the
+  chat-formatted train/val split from `data/synthetic/` (`build_dataset`), and fine-tunes with a
+  response-masked `SFTTrainer` (`build_trainer`). `unsloth`/`trl` are imported lazily inside the
+  functions that need them, so the data pipeline and CLI stay importable/testable without a CUDA
+  GPU; only actually running training requires one. Target environment: Colab T4
+  (`notebooks/train_colab.ipynb`, step 3.6).
 - **`src/evaluate.py`** — will run the before/after comparison. Key design point from `SCOPE.md`:
   structured decoding (via `outlines`) is applied to **both** the base and fine-tuned model during
   eval, so JSON validity is controlled for and the measured metric (per-field exact-match F1) isolates

@@ -60,8 +60,11 @@
 - [x] **3.4.6** `Sonnet` — `notebooks/train_colab.ipynb`: thin Colab wrapper.
   `pip install unsloth` → clone repo → upload `data/synthetic/*.jsonl` (gitignored,
   doesn't come with the clone) → `--smoke` → full run → download adapter.
-- [ ] **3.4.7** `Sonnet` — Local sanity: unit-test the non-GPU parts (format +
-  data loading). Full GPU run is 3.6.
+- [x] **3.4.7** `Sonnet` — Local sanity: unit-test the non-GPU parts (format +
+  data loading). Full GPU run is 3.6. `tests/test_prompt_format.py` +
+  `tests/test_train.py` (21 tests, `pytest.ini` adds `src/` to path); extracted
+  `resolve_max_steps` and gave `parse_args(argv=None)` so the CLI logic is
+  directly unit-testable. All pass locally.
 
 ## Constraint
 

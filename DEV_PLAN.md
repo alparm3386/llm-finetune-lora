@@ -24,13 +24,21 @@
   (deterministic per-example nullable-field presence plan, name-diversity hints, banned generic
   names). Full set generation: **150/domain** in progress. (Chat-template formatting moves into
   the 3.4 training script.)
-- [ ] **3.4** `use Opus` — QLoRA training script: 4-bit quantization (bitsandbytes),
-  `LoraConfig` (target modules, r, alpha, dropout), `Trainer`/`SFTTrainer` loop, checkpointing.
-  Should also have a config runnable at small scale (a few hundred steps).
+- [x] **3.4** QLoRA training script (`src/train.py`, `src/prompt_format.py`,
+  `notebooks/train_colab.ipynb`): shared chat-prompt module; data loading + seeded train/val
+  split; Unsloth `FastModel` 4-bit load + LoRA adapter (r=alpha=16, text-only via
+  `finetune_*_layers`); `SFTTrainer`/`SFTConfig` T4-tuned + `train_on_responses_only`; CLI
+  (`--smoke` at 60 steps, seeds, resume-from-checkpoint); thin Colab notebook wrapper; unit tests
+  for all non-GPU parts (21 passing). See `DEV_PLAN_3.4.md` for the full breakdown. Training
+  itself hasn't run yet — no local CUDA GPU — that's step **3.6** on Colab T4.
 - [ ] **3.5** Eval script: before/after comparison of the base vs. fine-tuned adapter, with
   structured decoding (`outlines`) applied to both to isolate the content-accuracy gain (see
   `SCOPE.md`'s structured-decoding-vs-fine-tuning section); per-field exact-match F1 as primary
-  metric, JSON validity rate (prompt-only) as secondary; results table written out.
+  metric, JSON validity rate (prompt-only) as secondary; results table written out. Detailed
+  breakdown in [`DEV_PLAN_3.5.md`](DEV_PLAN_3.5.md) (9 sub-steps). Includes **3.5.0**: create the
+  **real hand-labeled eval set** (`data/eval/*.jsonl`) — scaffolding + validator here, labeling is
+  a manual task. This eval-set + the trained adapter (3.6) are the run-time prerequisites, so the
+  full eval run happens within **3.6**.
 - [ ] **3.6** Run training on **Colab T4** (Unsloth), save the adapter, record results.
 - [ ] **3.7** Upload the adapter to the **Hugging Face Hub** with a model card (task, base model,
   data, hyperparameters, before/after results, limitations).

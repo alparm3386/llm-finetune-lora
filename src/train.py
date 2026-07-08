@@ -260,7 +260,7 @@ def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
     tokenizer.save_pretrained(output_dir)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "QLoRA fine-tune Gemma 4 E2B on the synthetic Hungarian text-to-JSON "
@@ -321,16 +321,20 @@ def parse_args() -> argparse.Namespace:
             "<out>/checkpoints; pass a path to resume from a specific one."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def resolve_max_steps(max_steps: int | None, smoke: bool) -> int | None:
+    """Resolve the effective `--max-steps`: explicit value wins, else `--smoke`
+    uses the smoke budget, else `None` (train the full `--epochs`)."""
+    if max_steps is not None:
+        return max_steps
+    return SMOKE_MAX_STEPS if smoke else None
 
 
 def main() -> None:
     args = parse_args()
-
-    # --max-steps wins; else --smoke uses the smoke budget; else full epochs.
-    max_steps = args.max_steps
-    if max_steps is None and args.smoke:
-        max_steps = SMOKE_MAX_STEPS
+    max_steps = resolve_max_steps(args.max_steps, args.smoke)
 
     logger.info("Loading base model %s (4-bit QLoRA)...", args.model)
     model, tokenizer = load_base_model(args.model, args.max_seq_length)
