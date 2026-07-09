@@ -83,6 +83,28 @@ So masking tracks whether the data has a clear input/target split (fine-tuning
 tasks often do; raw pretraining text doesn't), not whether the training is
 "pretraining" or "fine-tuning" per se.
 
+**So could we skip masking and just do continued pretraining on our data
+instead of SFT?** Yes, that's a real, named technique — **continued pretraining**
+(aka "domain-adaptive pretraining"): keep doing next-token prediction, but on
+new domain data (e.g. a pile of Hungarian medical/business/tech text) instead
+of `prompt → JSON` pairs. It teaches a *different* thing than what we need,
+though:
+
+- **Continued pretraining** (no input/output split): the model gets better at
+  Hungarian domain *vocabulary, style, fluency* — "sounds like" a Hungarian
+  medical text. No explicit signal for "given this input, produce exactly this
+  output" — just statistical patterns of raw text.
+- **SFT with masking** (our approach): explicitly teaches the *behavior* —
+  "given this input shape, produce this output shape." A much more direct
+  signal for a structured task.
+
+Why this matters practically here: continued pretraining needs a *lot* of data
+(many MBs–GBs of domain text) to meaningfully shift behavior, since the signal
+per token is weak (predict-the-next-word, not do-the-task). We only have ~450
+curated examples — plenty for SFT (each example is a strong, direct
+demonstration of the exact task), nowhere near enough to move the needle via
+continued pretraining.
+
 The other risk introduced by pushing fine-tuning too far: **catastrophic forgetting** — push the learning rate
 too hard or train too long on a narrow dataset, and the model can lose some
 general pretrained ability while overfitting to the small fine-tuning set. This
