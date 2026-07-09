@@ -9,6 +9,8 @@
 ## Table of contents
 
 1. [Big picture: what is fine-tuning, and why LoRA/QLoRA](#1-big-picture-what-is-fine-tuning-and-why-loraqlora)
+2. [Does quantization (Q4 vs. full precision) hurt fine-tuned quality?](#2-does-quantization-q4-vs-full-precision-hurt-fine-tuned-quality)
+3. [Fixed GPU budget: more data on Q4, or less data on full precision?](#3-fixed-gpu-budget-more-data-on-q4-or-less-data-on-full-precision)
 
 ---
 
@@ -150,3 +152,104 @@ Trickier "why" points:
 - LoRA/QLoRA mechanics (3.4.3) — quantization, target modules, r/alpha/dropout
 - The training loop (3.4.4) — SFTTrainer, hyperparameters, steps vs. epochs
 - Evaluation & metrics (3.5.1) — per-field F1, why nullable fields matter
+
+---
+
+## 2. Does quantization (Q4 vs. full precision) hurt fine-tuned quality?
+
+**Setup:** imagine we had both a 4-bit (Q4) and a full-precision copy of the
+same base model, and fine-tuned both on the same training set. Does the
+full-precision one end up with better quality on the *new* skill, or does
+fine-tuning erase that gap?
+
+**Short answer: full precision generally still comes out slightly ahead, but
+the gap shrinks a lot after fine-tuning — it doesn't fully close, but it's not
+"doesn't matter" either.**
+
+Reasoning:
+
+1. **Quantization = lossy compression of the base weights.** 4-bit rounds each
+   weight to one of 16 possible values — a small but real information loss vs.
+   full precision. The base model ends up slightly "blurrier."
+
+2. **The LoRA adapter compensates only *locally*, for the specific skill being
+   trained.** During QLoRA fine-tuning, the adapter's gradients are computed
+   against the *quantized* base model's actual behavior — so it learns "given
+   how this quantized model behaves, nudge it toward correct outputs for this
+   task." It's compensating for that base's actual (slightly noisy)
+   representations, not recovering the lost information. Two different frozen
+   bases (Q4 vs. FP16) end up with two adapters that each "solved" the task
+   starting from a different baseline.
+
+3. **Whether it matters depends on whether the quantization noise interferes
+   with the *specific* skill being taught:**
+   - A narrow, well-defined skill like structured extraction (map document →
+     JSON fields) is fairly "shallow" — mostly format-following +
+     copying/locating values, not deep reasoning or rare knowledge. Fine-tuning
+     tends to close most of the gap here, thanks to a strong, direct training
+     signal per example.
+   - Skills relying on subtler capability (nuanced reasoning, rare factual
+     recall, a lower-resource language like Hungarian where representations are
+     already thinner) are more likely to keep a real, noticeable gap, since the
+     quantization noise compounds with an already-weaker signal.
+
+4. **This tracks the actual QLoRA paper's finding** (Dettmers et al., 2023):
+   4-bit QLoRA fine-tuning gets *close to* 16-bit full fine-tuning quality on
+   many benchmarks — "near-lossless," not identical. That's the empirical case
+   for QLoRA's popularity: the trade-off is usually worth it for the memory
+   savings, but it's not a free lunch.
+
+**For this project:** QLoRA was picked purely for the **hardware constraint**
+(free Colab T4, 16GB) — not because we tested whether Q4 vs. FP16 fine-tuning
+quality differs for this specific task. Worth being explicit about that
+assumption if it comes up in the README / model card (3.8).
+
+---
+
+## 3. Fixed GPU budget: more data on Q4, or less data on full precision?
+
+**Setup:** limited GPU-time budget for fine-tuning on a specific domain/task.
+Better strategy — larger training data on a small quantized (Q4) base model, or
+less training data on a full-precision model?
+
+**Short answer: for a narrow, well-defined task (like structured extraction),
+going wider — Q4 + more data — usually beats going higher-precision with less
+data.**
+
+Reasoning:
+
+1. **Q4 training is cheaper per step** (less memory → bigger batches fit, less
+   compute per forward/backward pass). For the same GPU-time budget, you can
+   push through *far more* training examples/steps on the quantized model than
+   on full precision. The real trade-off: fewer, higher-fidelity updates vs.
+   many more, slightly-noisier updates.
+
+2. **For narrow tasks, data coverage tends to dominate the accuracy curve.**
+   Most of the quality gain for something like "extract these 8 fields
+   reliably" comes from seeing enough varied examples — different phrasings,
+   edge cases, nullable-field patterns, all domains well represented. Going
+   from 50 → 450 examples typically buys far more accuracy than the small
+   ceiling difference between a Q4 and FP16 base (see
+   [section 2](#2-does-quantization-q4-vs-full-precision-hurt-fine-tuned-quality)
+   — that gap is small for shallow, format-driven tasks).
+
+3. **Quantization noise partially averages out with more gradient updates.**
+   More steps means more chances for the LoRA adapter to correct for the base's
+   quantization quirks specifically in the weight-space region relevant to the
+   task.
+
+4. **Caveat — this flips if extra data is padding, not signal.** Piling on more
+   synthetic examples that are repetitive or low-diversity doesn't help — it's
+   *diverse, correct* coverage that matters, not raw count. 150 well-varied
+   examples/domain can beat 1000 near-duplicate ones.
+
+5. **Caveat #2 — this heuristic weakens for tasks needing deep/rare knowledge
+   or subtle reasoning**, where the base model's raw fidelity (not just
+   fine-tuning data volume) sets a harder ceiling — extra fine-tuning examples
+   can't fully compensate for a blurrier base there. Structured extraction,
+   being closer to "format + locate/copy," isn't really in that regime.
+
+**For this project:** "quantized base + as much good data as the budget
+allows" is already the direction taken (QLoRA + synthetic data generation) —
+just originally for a different reason (free Colab T4 hardware constraint),
+not this specific precision/data trade-off.

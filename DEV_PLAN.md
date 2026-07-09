@@ -1,4 +1,4 @@
-# Dev Plan — `hu-llm-finetune-lora`
+# Dev Plan — `llm-finetune-lora`
 
 > Project 3 of the [portfolio dev plan](../portfolio-dev-plan.md) — ⭐ flagship.
 > Covers the remaining keyword gaps: `PyTorch` · `Hugging Face` · `LoRA/QLoRA` · `transformers/PEFT`.
@@ -11,7 +11,7 @@
   Hungarian HF dataset; precedent: `paraloq/json_data_extraction`), success metric **per-field
   exact-match F1 with structured decoding on both models (primary) + JSON validity rate
   (secondary)**.
-- [x] **3.2** Repo scaffold: `hu-llm-finetune-lora` created, `requirements`/setup on an
+- [x] **3.2** Repo scaffold: `llm-finetune-lora` created, `requirements`/setup on an
   **Unsloth base** (`unsloth` transitively pulls in `torch`, `transformers`, `peft`, `trl`,
   `bitsandbytes`, `accelerate`, `datasets`), `.gitignore`, MIT license (for the own code), empty
   `README`. Training environment: **Google Colab** (not RunPod).

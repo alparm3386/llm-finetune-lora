@@ -1,4 +1,4 @@
-# SCOPE — `hu-llm-finetune-lora`
+# SCOPE — `llm-finetune-lora`
 
 > Output of step **3.1** of the dev plan. Defines the scope of the fine-tuning project:
 > base model · task · dataset · success metric · environment. The remaining steps (3.2–3.8) follow from this.

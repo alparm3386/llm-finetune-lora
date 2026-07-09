@@ -1,4 +1,4 @@
-# hu-llm-finetune-lora
+# llm-finetune-lora
 
 QLoRA fine-tuning of Gemma 4 E2B for Hungarian structured extraction (text → JSON).
 
