@@ -22,6 +22,8 @@
 12. [Peeking at `modeling_gemma4.py`: how complex is it, really?](#12-peeking-at-modeling_gemma4py-how-complex-is-it-really)
 13. [Is HF `transformers` the only widely-used port?](#13-is-hf-transformers-the-only-widely-used-port)
 14. [What host runtime does each port need? HF `transformers` vs. vLLM, with examples](#14-what-host-runtime-does-each-port-need-hf-transformers-vs-vllm-with-examples)
+15. [Is HF `transformers` just for experiments, and vLLM for prod?](#15-is-hf-transformers-just-for-experiments-and-vllm-for-prod)
+16. [Deploying a LoRA adapter via vLLM](#16-deploying-a-lora-adapter-via-vllm)
 
 ---
 
@@ -933,3 +935,105 @@ attach adapter" deploy story (3.7, section 5) stay in the `transformers`/
 PyTorch runtime — the right call here, since this is a fine-tuning + modest
 demo deploy, not a high-throughput production server where vLLM's trade-offs
 would pay off.
+
+---
+
+## 15. Is HF `transformers` just for experiments, and vLLM for prod?
+
+**Setup:** rough mental model check — vLLM is for prod deployment (nice
+OpenAI-style endpoint, real traffic), HF `transformers` is for trying things
+once / experiments. Is that right?
+
+**Mostly right, with one important refinement: the cleaner split isn't
+"experiment vs. prod," it's "can train/modify the model" vs. "can serve the
+model at scale."**
+
+**vLLM for prod** — right, and it's not really about the OpenAI-style API
+being "nice" (that's just the interface). The actual value is underneath:
+PagedAttention + continuous batching (section 14) let one GPU serve **many
+concurrent requests** far more cheaply than looping `model.generate()`
+per-request. If the deploy shape is "one endpoint, real traffic, cost-per-request
+matters" — that's exactly the trade-off vLLM was built for.
+
+**HF `transformers` is not *just* for one-off experiments — it's the only one
+of the two that can train at all.** vLLM is an inference-only serving engine
+(no backward pass); this project's entire training stack — PEFT, Unsloth,
+`trl`/`SFTTrainer`, `train.py` itself — is built directly on `transformers`'
+Python object model, because that's the only layer where gradients/backprop
+exist. So `transformers` isn't "the toy version you graduate from," it's
+"the layer where modification happens at all." Its other legitimate uses
+beyond training:
+- One-off experiments (what prompted this question)
+- Low-traffic/single-user apps, where vLLM's batching setup isn't worth it
+- Debugging/inspecting internals (hooking intermediate activations, etc.) —
+  much easier against eager Python objects than through vLLM's
+  optimized-away internals
+
+**The cleaner mental model:** `transformers` owns "can modify/train the
+model" entirely (nothing else in this landscape can); vLLM/TensorRT-LLM/etc.
+own "can serve the model at scale." **This project actually straddles both**:
+`train.py` uses `transformers`/Unsloth because it *must* (training only
+exists there), while the eventual demo deploy (3.7-3.8) will likely *also*
+stay on `transformers` — not because it's "just for experiments," but because
+"one demo, low traffic" genuinely doesn't need vLLM's scale-serving
+trade-offs yet.
+
+---
+
+## 16. Deploying a LoRA adapter via vLLM
+
+**Setup:** train with `transformers`/Unsloth (section 15 — the only layer
+that can train), then deploy the result via vLLM (the scale-serving layer,
+section 14). How does the LoRA adapter specifically get into vLLM?
+
+**vLLM has native LoRA support — no merging required.** It can load the base
+model once into GPU memory and swap adapters per-request, which is the actual
+point of adapters over full fine-tunes: one base model, many cheap
+task-specific variants layered on top.
+
+**As a server:**
+```bash
+vllm serve google/gemma-4-E2B \
+  --enable-lora \
+  --lora-modules hu-extract=/path/to/models/lora_adapter \
+  --port 8000
+```
+`/path/to/models/lora_adapter` is exactly what `save_adapter()` writes in
+[`train.py`](src/train.py#L252-L260) — the `args.out` directory `main()`
+passes at the end of training (adapter weights + tokenizer, not merged base
+weights — see the function's own docstring). `hu-extract` is an arbitrary
+name, used as the `"model"` field in requests.
+
+```python
+import openai
+
+client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+resp = client.chat.completions.create(
+    model="hu-extract",   # selects the LoRA adapter, not the base model
+    messages=[{"role": "user", "content": "..."}],
+)
+```
+Multiple `--lora-modules` can be registered at once, all sharing the same
+loaded base model underneath.
+
+**Offline, no server:**
+```python
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
+
+llm = LLM(model="google/gemma-4-E2B", enable_lora=True)
+sampling_params = SamplingParams(max_tokens=200)
+
+lora_request = LoRARequest("hu-extract", 1, "/path/to/models/lora_adapter")
+outputs = llm.generate(["Szöveg: ..."], sampling_params, lora_request=lora_request)
+print(outputs[0].outputs[0].text)
+```
+The `1` is an arbitrary numeric adapter ID vLLM tracks internally — must be
+unique per adapter if several are loaded at once.
+
+**Worth flagging for this project specifically:** vLLM's LoRA hot-swap
+support requires target modules it knows how to handle — standard
+`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/`down_proj` (exactly
+decision E's target modules, section 7) are well-supported, so no conflict
+with the current setup. If the target modules ever changed to something
+unusual, that would be the first thing to check against vLLM's LoRA docs.
