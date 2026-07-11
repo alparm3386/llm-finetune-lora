@@ -11,6 +11,13 @@
 1. [Big picture: what is fine-tuning, and why LoRA/QLoRA](#1-big-picture-what-is-fine-tuning-and-why-loraqlora)
 2. [Does quantization (Q4 vs. full precision) hurt fine-tuned quality?](#2-does-quantization-q4-vs-full-precision-hurt-fine-tuned-quality)
 3. [Fixed GPU budget: more data on Q4, or less data on full precision?](#3-fixed-gpu-budget-more-data-on-q4-or-less-data-on-full-precision)
+4. [Training memory vs. inference memory](#4-training-memory-vs-inference-memory)
+5. [A model = architecture + weights: where each lives, and how deployment works](#5-a-model--architecture--weights-where-each-lives-and-how-deployment-works)
+6. [Why PyTorch/HF instead of the "original" framework (JAX) a model was trained in?](#6-why-pytorchhf-instead-of-the-original-framework-jax-a-model-was-trained-in)
+7. [Where exactly does LoRA attach in the architecture?](#7-where-exactly-does-lora-attach-in-the-architecture)
+8. [Open weight vs. open source, and reading a real config.json](#8-open-weight-vs-open-source-and-reading-a-real-configjson)
+9. [3.4.1 — what one training example actually looks like (`prompt_format.py`)](#9-341--what-one-training-example-actually-looks-like-prompt_formatpy)
+10. [A checklist for reading any new model's config.json](#10-a-checklist-for-reading-any-new-models-configjson)
 
 ---
 
@@ -253,3 +260,413 @@ Reasoning:
 allows" is already the direction taken (QLoRA + synthetic data generation) —
 just originally for a different reason (free Colab T4 hardware constraint),
 not this specific precision/data trade-off.
+
+---
+
+## 4. Training memory vs. inference memory
+
+**Setup:** full fine-tuning needs "huge GPU memory" — but doesn't *inference*
+need huge memory too, since it's the same big model?
+
+**Short answer: no — training and inference have very different memory
+profiles, and that asymmetry is exactly why QLoRA is cheap to train but not
+noticeably cheaper to *run* than a fully fine-tuned model.**
+
+In units of "weight memory" (X = size of the weights alone):
+
+- **Inference** only needs the weights loaded (no gradients, no optimizer
+  state) — roughly **1x**, regardless of *how* the model was trained. A fully
+  fine-tuned model and a LoRA-adapted model are basically the same size at
+  inference (LoRA just adds a tiny adapter on top of the same frozen base).
+- **Training** needs much more, because of what has to be kept around for
+  backprop:
+  - Weights: 1x
+  - Gradients (one per trainable weight): 1x
+  - Adam optimizer state (momentum + variance per weight): 2x
+  - **Subtotal: ~4x**, before even counting activations (intermediate values
+    kept for backprop), which add more on top and scale with batch
+    size/sequence length — so real-world estimates are often **~4-6x**
+    inference memory for full fine-tuning.
+
+This is why QLoRA is cheap on *both* axes: the frozen base needs no
+gradients/optimizer state at all (only the tiny adapter does), so training
+memory drops close to inference memory. Full fine-tuning, by contrast, pays
+that ~4-6x multiplier on the *entire* model, every one of its billions of
+weights.
+
+---
+
+## 5. A model = architecture + weights: where each lives, and how deployment works
+
+A model is really two separate things bundled together:
+
+- **Architecture**: the code defining the computation graph — how many
+  layers, attention mechanism, activation functions, normalization scheme,
+  position embeddings. Fixed by design, versioned, lives in a *library*
+  (e.g. Hugging Face's `transformers`, in a file like `modeling_gemma3.py`).
+- **Weights**: the actual learned numbers sitting inside that architecture's
+  matrices. Meaningless without knowing which architecture to plug them into
+  — and the architecture with random weights just produces garbage. You need
+  both.
+
+**Where the architecture is actually defined:** a downloaded HF model folder
+looks like `config.json` + `model.safetensors` + tokenizer files. The weights
+file has no code in it — just tensors keyed by name. `config.json` has an
+`"architectures"` field (e.g. `"Gemma3ForCausalLM"`) that's a pointer to a
+Python class **already living in the `transformers` library** (installed via
+`pip install transformers`) — not something downloaded per-model.
+
+**How loading connects the two** — `AutoModelForCausalLM.from_pretrained(...)`:
+1. Downloads `config.json`, reads the `"architectures"` field
+2. Looks up the matching class already installed in the library
+3. Instantiates it with the config's hyperparameters (empty/random weights)
+4. Downloads `model.safetensors`, loads tensors into the matching layers
+5. Returns a ready-to-run model object
+
+**The dependency chain, end to end:**
+```
+JAX/PyTorch/TensorFlow   → low-level tensor math + autograd (the "engines")
+        ↓
+Model developer (e.g. Google) trains internally — architecture design + weights
+        ↓
+A PyTorch port is written + weights converted → published to the HF Hub
+        ↓
+`transformers` library — hosts/standardizes the port, easy loading API
+        ↓
+You: AutoModelForCausalLM.from_pretrained("google/gemma-4-E2B")
+```
+Note the direction: the model developer doesn't build on top of HF — they
+train independently (often in a different framework, see
+[section 6](#6-why-pytorchhf-instead-of-the-original-framework-jax-a-model-was-trained-in)),
+and a PyTorch-compatible port + weights get published *to* HF afterward. HF is
+a distribution/compatibility hub, not a foundation the model was built on.
+
+**Deploying a downloaded model, in increasing order of "real":**
+- **Script-level**: `from_pretrained(...)` + `model.generate(...)` in Python —
+  already "deployed" in the loosest sense.
+- **Serve it as an API**: vLLM (`vllm serve ...`, optimized for throughput —
+  continuous batching, paged attention), TGI (Hugging Face's own serving
+  stack), llama.cpp/Ollama (for quantized GGUF models, great for local/CPU or
+  small-GPU use), or a DIY FastAPI wrapper around `generate()`.
+- **With a LoRA adapter specifically** (this project's eventual output): load
+  the base model, then `PeftModel.from_pretrained(base_model, "path/to/adapter")`
+  to attach it — either kept as a separate small file layered on at load time,
+  or merged once (`model.merge_and_unload()`) into a single standalone
+  checkpoint.
+
+**For this project:** step 3.7 (publish adapter to HF Hub) means the eventual
+deploy story is just "load the base model + attach the adapter" — no custom
+architecture work needed, since Gemma's architecture already ships in
+`transformers`/Unsloth.
+
+---
+
+## 6. Why PyTorch/HF instead of the "original" framework (JAX) a model was trained in?
+
+**Setup:** Google trains Gemma internally, and it likely isn't PyTorch they
+use — so wouldn't it be simpler in production to stick with the original
+framework, whatever that was, rather than going through a PyTorch/HF port?
+
+**Short answer: it depends entirely on who you are — for Google, staying in
+their native stack is simpler; for practically everyone else (this project
+included), the PyTorch/HF path is simpler, precisely because of the "extra"
+conversion step, not despite it.**
+
+The framework landscape has **three** major players, not two:
+- **PyTorch** (Meta-originated, dominant in the open community)
+- **TensorFlow** (Google, older, declining in research use)
+- **JAX** (Google's own framework) — and this is the one Google's own model
+  teams, including Gemma, mostly train with internally (often via Flax on
+  top of it), not PyTorch or TensorFlow.
+
+**JAX is fully open source** (Apache 2.0, `google/jax` on GitHub) — anyone
+can `pip install jax` and use it, on GPU or TPU, no special access needed.
+The gap isn't legal/access-based, it's ecosystem maturity for a specific
+workflow.
+
+**Why JAX is genuinely the better tool — for Google's job:**
+1. **Functional composability** — `grad`/`vmap`/`pmap`/`jit` let you
+   transform plain math functions (auto-diff, auto-vectorize,
+   auto-parallelize) with clean composition, which suits writing *massively
+   distributed* training code (thousands of TPU chips) more naturally than
+   PyTorch's more imperative `nn.Module` style.
+2. **XLA compilation, TPU-first** — JAX traces the whole computation and
+   compiles it ahead of time via XLA, tuned hard for TPU pods specifically
+   (PyTorch has been catching up with `torch.compile`, but JAX was XLA-first
+   from day one).
+3. **Built for frontier-scale pretraining** — thousands of TPUs, weeks of
+   compute, Google's own hardware. JAX was purpose-built for exactly this.
+
+**Why PyTorch/HF is genuinely the better tool — for almost everyone else's
+job (fine-tune/deploy an existing checkpoint on commodity GPUs):**
+1. **Ecosystem gravity** — nearly all the practical tooling (vLLM, TGI,
+   Ollama, llama.cpp for serving; PEFT/LoRA, Unsloth, `bitsandbytes` for
+   fine-tuning/quantization; thousands of community checkpoints/tutorials)
+   was built around PyTorch/HF. JAX's equivalents (Flax, Optax, some LoRA
+   implementations) exist but are far less battle-tested for this exact
+   "download a checkpoint → fine-tune cheaply → serve it" workflow.
+2. **Hardware reality** — JAX shines on TPUs; most practitioners (this
+   project included, targeting a free Colab T4) have **GPUs**, where
+   PyTorch's CUDA tooling is the mature, default choice.
+3. **The "extra step" is invisible to you as a consumer** — the PyTorch port
+   already exists and is maintained by others; you just `pip install
+   transformers` and load it. You're not paying a conversion cost, you're
+   benefiting from one someone else already paid.
+
+Neither framework is "worse" in general — each is the right tool for a
+different nail. Google uses the tool built for training frontier models at
+massive scale on their own hardware; this project uses the tool built for
+fine-tuning/deploying an existing checkpoint on a commodity GPU.
+
+---
+
+## 7. Where exactly does LoRA attach in the architecture?
+
+**LoRA is not a new layer inserted into the graph — it's a wrapper around an
+existing linear layer's forward pass.** A linear layer computes `y = Wx`;
+LoRA changes this to `y = Wx + (BA)x`, where `W` (the original, large weight
+matrix) stays frozen, and `B`/`A` are two small new matrices whose product
+approximates a low-rank *update* to `W`. Same position in the network, same
+layer slot — just modified math, with a small addition on top.
+
+**Which layers, concretely** — within one Transformer block:
+```
+Input
+  ↓
+[Self-Attention]
+  ├─ q_proj (query)   ← LoRA target
+  ├─ k_proj (key)     ← LoRA target
+  ├─ v_proj (value)   ← LoRA target
+  └─ o_proj (output)  ← LoRA target
+  ↓
+[Add + Norm]  (residual connection — no weights, nothing to adapt)
+  ↓
+[MLP / Feed-Forward]        ("Multi-Layer Perceptron" — a small standalone
+  ├─ gate_proj  ← LoRA target   feed-forward network: expand the vector to a
+  ├─ up_proj    ← LoRA target   wider size, apply a non-linearity, then
+  └─ down_proj  ← LoRA target   compress back down. Typically holds the
+  ↓                             majority of a Transformer's total parameters.
+[Add + Norm]  (again, skipped)
+  ↓
+Output → feeds into next block
+```
+LoRA does **not** touch normalization layers (no large weight matrix worth
+adapting) or residual connections (not even a learned layer). It *can*
+optionally target the embedding layer and final LM head too, but this
+project's `train.py` keeps it attention+MLP only via the `finetune_*_layers`
+flags (text-only, per the Architecture section above).
+
+**Critically, this whole pattern repeats identically at every block in the
+stack** — not just once at the top or bottom. A model with, say, 26
+Transformer blocks gets 26 × 7 = 182 separately LoRA-wrapped layers, each with
+its own small adapter matrices. Total adapter size stays tiny (~1% of model
+parameters) because each individual pair is small, but it's applied
+*throughout the whole depth* of the network — letting the adapter shift
+behavior at every stage of the model's processing, not just at the input or
+output.
+
+**Is this architecture-specific, or a general library?** General library —
+that's the whole appeal. Hugging Face's **PEFT** (and Unsloth's faster
+implementation) takes a loaded model plus a list of **target module names**
+(exactly the `q_proj`/`k_proj`/.../`down_proj` names above), walks the model,
+and swaps each matching named submodule for a wrapped version adding the `BA`
+term. Nothing about this requires the architecture's original developer
+(Google, for Gemma) to build in special support — it works on any model built
+from standard `nn.Linear` layers, which is effectively all Transformer
+implementations. The only architecture-*awareness* needed is knowing which
+module names exist in a given family — which Unsloth ships sensible presets
+for per model family, so `train.py` doesn't have to guess.
+
+---
+
+## 8. Open weight vs. open source, and reading a real config.json
+
+**Setup:** if `config.json` fully discloses the architecture (needed just to
+run the model at all), what does "open weight, not open source" actually
+withhold?
+
+**Short answer: the architecture is essentially always public for open-weight
+models — what's withheld is the training data, the training code/recipe, and
+often the license's freedom to use/modify/redistribute.**
+
+- **Open weight** = you can download and run the finished checkpoint.
+  Necessarily includes a public architecture (`config.json` +
+  `modeling_*.py` in `transformers`) — otherwise the weights would be
+  unusable, defeating the point of releasing them.
+- **Open source** (stricter, per the OSI's Open Source AI definition) =
+  additionally, training data + training code are disclosed *and* the
+  license imposes no usage restrictions. Llama, Gemma, Mistral, Qwen are all
+  "open weight" but **not** "open source" by this bar — their licenses carry
+  usage restrictions (e.g. Llama's >700M-MAU clause), and none disclose their
+  full training data/recipe. A few research efforts (OLMo, Pythia) go further
+  and qualify as genuinely open source.
+
+### Reading a real `config.json` — `google/gemma-4-E2B`'s `text_config`
+
+Fetched the live file from the HF Hub; the `text_config` block reads like
+this (trimmed to the interesting fields):
+
+```json
+{
+  "num_hidden_layers": 35,
+  "hidden_size": 1536,
+  "num_attention_heads": 8,
+  "num_key_value_heads": 1,
+  "head_dim": 256,
+  "sliding_window": 512,
+  "max_position_embeddings": 131072,
+  "vocab_size": 262144,
+  "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention",
+                  "sliding_attention", "full_attention", "..."],
+  "rope_parameters": {
+    "full_attention":    {"rope_theta": 1000000.0, "rope_type": "proportional", "partial_rotary_factor": 0.25},
+    "sliding_attention": {"rope_theta": 10000.0,    "rope_type": "default"}
+  },
+  "num_kv_shared_layers": 20,
+  "final_logit_softcapping": 30.0,
+  "tie_word_embeddings": true,
+  "enable_moe_block": false
+}
+```
+
+What each interesting bit means:
+
+- **`num_key_value_heads: 1` vs. `num_attention_heads: 8`** — Grouped-Query
+  Attention pushed to the extreme (effectively Multi-Query Attention): all 8
+  query heads share a single K/V head. Ties directly back to
+  [section 7](#7-where-exactly-does-lora-attach-in-the-architecture)'s
+  `q_proj`/`k_proj`/`v_proj` — here `k_proj`/`v_proj` are tiny relative to
+  `q_proj`, which shrinks the KV-cache a lot (cheaper long-context inference).
+- **`layer_types` alternating pattern** — 4 `sliding_attention` layers then 1
+  `full_attention`, repeating. Sliding layers only look at a local window
+  (`sliding_window: 512` tokens, cheap); full-attention layers look at the
+  entire sequence (expensive, but needed for long-range dependencies). Mixing
+  the two is what makes a 131k-token context (`max_position_embeddings`)
+  affordable.
+- **Per-layer-type RoPE** (`rope_parameters`) — position encoding is tuned
+  differently depending on the layer's attention range: sliding layers use a
+  small `rope_theta` (short-range), full-attention layers use a much larger
+  one with a `partial_rotary_factor` (tuned for long-range positions).
+  Splitting this by layer type is a direct consequence of the local/global
+  attention split above.
+- **`num_kv_shared_layers: 20`** — 20 of the 35 layers share a KV cache
+  instead of each keeping their own, another memory-saving trick, consistent
+  with this being an "effective size" (E2B) model aimed at lean deployment.
+- **`final_logit_softcapping: 30.0`** — clips final logits into a bounded
+  range before softmax; a Gemma-specific stability trick.
+- **`enable_moe_block: false`** — the code path for mixture-of-experts
+  exists (shared with a bigger sibling in the same family) but is switched
+  off for this checkpoint.
+
+**Ties back to earlier sections:** this is `config.json` acting exactly as
+described in [section 5](#5-a-model--architecture--weights-where-each-lives-and-how-deployment-works)
+— a complete, inspectable spec sheet, nothing hidden. And it's *why* a LoRA
+adapter is tied to one exact model (section 7): the adapter's matrix shapes
+are derived straight from these numbers (`hidden_size`, `head_dim`, etc.) —
+change the config, and the adapter no longer fits.
+
+---
+
+## 9. 3.4.1 — what one training example actually looks like (`prompt_format.py`)
+
+`src/prompt_format.py` is the module that decides exactly what text the model
+sees and what it's supposed to produce — shared by `train.py` and (later)
+`evaluate.py` so both stages use a byte-identical prompt. If training and eval
+prompts drifted even slightly, you'd effectively be evaluating a different
+task than the one trained.
+
+Three small functions do all the work:
+
+1. **`build_prompt(domain, document)`** — assembles the "user" turn: a fixed
+   Hungarian instruction ("extract the requested data, return exactly one
+   JSON object matching the schema, use `null`/`[]` for missing fields, no
+   extra text") + the domain's JSON Schema (from `schemas.py`, pretty-printed)
+   + the raw Hungarian document.
+
+2. **`serialize_gold(gold, domain)`** — turns the gold-answer dict into the
+   target JSON string, but **forces key order to match the schema's property
+   order**, not the source JSONL's arbitrary order. Reasoning: if training
+   targets had inconsistent key ordering across examples, the model would
+   waste learning capacity on "what order do keys come in" instead of the
+   actual field values — a small format-consistency decision that keeps the
+   training signal focused on content.
+
+3. **`to_chat_messages(domain, document, gold=None)`** — wraps both into
+   `[{"role": "user", ...}, {"role": "assistant", ...}]`, the format Gemma's
+   chat template expects. With `gold` omitted (inference/eval time), it
+   returns just the user turn, ready for
+   `apply_chat_template(..., add_generation_prompt=True)` — this is the hook
+   `evaluate.py` (3.5) will reuse.
+
+Concretely, one training example renders to something like:
+```
+<start_of_turn>user
+Az alábbi magyar nyelvű szövegből nyerd ki...
+JSON séma: {...}
+Szöveg: [the Hungarian document]
+<start_of_turn>model
+{"patient_name": "...", "diagnosis": "...", ...}
+```
+That whole string — prompt + target concatenated — is what gets tokenized and
+fed to the model. `train_on_responses_only` (decision C, section 1) then masks
+everything except the `<start_of_turn>model` completion, so loss is only
+computed on the gold-JSON part, not the prompt/schema text.
+
+---
+
+## 10. A checklist for reading any new model's config.json
+
+**Setup:** when sizing up an unfamiliar model's `config.json`, what actually
+matters, in what order?
+
+1. **`architectures` + `model_type`.** Tells you which class loads the model
+   (e.g. `Gemma4ForConditionalGeneration`) — check it against your installed
+   `transformers_version`; a mismatch means `from_pretrained()` will fail or
+   need a newer/dev install.
+
+2. **Single-tower or composite?** Check first, before anything else. Some
+   configs are one flat block; others (like `google/gemma-4-E2B`, fetched live
+   from the Hub) nest separate `text_config` / `vision_config` / `audio_config`
+   blocks — three distinct towers glued together, not one Transformer. This is
+   exactly what decided `train.py`'s `finetune_vision_layers=False` call
+   (section 7) — you can't know that flag is needed without seeing this
+   nesting.
+
+3. **Size knobs, for compute/VRAM budgeting:** `num_hidden_layers` × `hidden_size`
+   gives rough depth/width; `intermediate_size` shows the MLP expansion ratio
+   (here 6144 = 4× the 1536 `hidden_size`, see section 7's MLP note);
+   `vocab_size` (262144 here) sizes the embedding matrix, which adds real
+   memory even though it's usually not a LoRA target.
+
+4. **Attention shape — the easy-to-miss gotcha:** `num_attention_heads` vs.
+   `num_key_value_heads` reveals GQA/MQA (here: 8 query heads share **1** KV
+   head — extreme grouped-query attention, shrinking the KV cache a lot). Also
+   don't assume `num_attention_heads × head_dim == hidden_size` — for this
+   model it's `8 × 256 = 2048 ≠ 1536`; some architectures just don't tie those
+   together.
+
+5. **Context length & attention pattern:** `max_position_embeddings` for the
+   trained ceiling; `layer_types` + `sliding_window` for whether attention
+   alternates between cheap local windows and full global attention (this
+   model: sliding every layer except every 5th, which is what makes a
+   131k-token context affordable — see section 8's worked example).
+
+6. **Unfamiliar fields → don't guess, look them up.** Fields like
+   `use_double_wide_mlp`, `num_kv_shared_layers`, `hidden_size_per_layer_input`,
+   `enable_moe_block` are architecture-specific quirks, not generic Transformer
+   vocabulary. `enable_moe_block: false` + `num_experts: null` here means
+   mixture-of-experts scaffolding exists in the code path but is switched off
+   for this particular checkpoint — a sibling model in the family likely uses it.
+
+7. **Tokenization/special tokens:** `bos_token_id`, `eos_token_id`,
+   `pad_token_id`, plus any modality tokens (`image_token_id`, `audio_token_id`,
+   etc. — this model has four, one per modality/boundary). Getting pad/eos
+   wrong is a classic silent bug: loss computed over padding, or generation
+   that never stops.
+
+**For QLoRA + Unsloth specifically:** in practice, only #2 (composite towers →
+which `finetune_*_layers` flags apply) and #3/#4 (does it fit a T4 at 4-bit)
+require manual judgment — Unsloth already knows Gemma's internals, so LoRA
+target shapes don't need to be hand-derived. This whole checklist matters most
+for a genuinely new/obscure architecture Unsloth doesn't have a preset for,
+where you'd write a `target_modules` list by hand instead.
