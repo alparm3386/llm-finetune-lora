@@ -20,6 +20,8 @@
 10. [A checklist for reading any new model's config.json](#10-a-checklist-for-reading-any-new-models-configjson)
 11. [`architectures` names a real class — config numbers plug into hand-written code, not the other way around](#11-architectures-names-a-real-class--config-numbers-plug-into-hand-written-code-not-the-other-way-around)
 12. [Peeking at `modeling_gemma4.py`: how complex is it, really?](#12-peeking-at-modeling_gemma4py-how-complex-is-it-really)
+13. [Is HF `transformers` the only widely-used port?](#13-is-hf-transformers-the-only-widely-used-port)
+14. [What host runtime does each port need? HF `transformers` vs. vLLM, with examples](#14-what-host-runtime-does-each-port-need-hf-transformers-vs-vllm-with-examples)
 
 ---
 
@@ -791,3 +793,143 @@ not novel ideas:
 than a raw file read, so treat exact line counts/snippets as "probably right"
 rather than verified — worth a direct read of the source if this ever matters
 for real debugging.
+
+---
+
+## 13. Is HF `transformers` the only widely-used port?
+
+**Setup:** HF `transformers` is "a port" for e.g. Gemma (section 11) — is it
+the only big community port, or are there others?
+
+**Short answer: HF is the dominant one, but far from the only one — several
+independent reimplementations exist, each targeting a different deployment
+niche, and each is its own separate hand-written translation of the original
+JAX math (same fragility as section 11's porting risk, just repeated across
+ecosystems).**
+
+**Some of the widely-used ports/runtimes:**
+
+- **`llama.cpp` / GGUF** — a from-scratch C/C++ reimplementation, no PyTorch
+  dependency at all. Optimized for CPU and consumer GPUs, quantized GGUF
+  formats. Powers Ollama, LM Studio. A genuinely independent codebase from
+  HF's — attention/RoPE/etc. re-derived in C++ by different people.
+- **vLLM** — loads HF-format weights, but runs its **own internal model
+  implementation** (not just calling `transformers`), rewritten for
+  high-throughput serving (paged attention, continuous batching). Using HF
+  checkpoints doesn't mean using HF's forward-pass code.
+- **MLX** — Apple's framework for Apple Silicon (M-series chips), with its
+  own model ports for local on-Mac inference.
+- **TensorRT-LLM** — NVIDIA's own port, compiled for maximum throughput on
+  NVIDIA GPUs, common in enterprise production serving.
+- **Google's own native formats** — since Google trains in JAX/Flax (section
+  6), they often also publish **native JAX/Flax weights** directly (Kaggle,
+  Google's own `gemma` JAX library) — not even a "port" in the same sense,
+  closer to the original training-time representation.
+- **ONNX Runtime** — a hardware-agnostic export format, used to deploy models
+  onto all kinds of specialized/edge/mobile hardware.
+
+**Why HF's port is the default for fine-tuning specifically (this project):**
+not because it's uniquely "more correct," but because the *tooling
+ecosystem* — PEFT, Unsloth, `bitsandbytes`, `trl`/`SFTTrainer` — is built
+directly against `transformers`' class interfaces. The other ports mostly
+target **inference/serving**, not training; you wouldn't typically fine-tune
+against a GGUF or TensorRT-LLM build.
+
+**The interesting implication, extending section 11:** every one of these
+ports is an *independent* hand-written translation of the same original math
+— so each could, in principle, carry subtly different bugs or numerical
+precision quirks vs. the JAX original, and vs. each other. Popular models get
+cross-validated fairly heavily (output comparisons against reference), but
+it's a real, occasionally-relevant reason "which port/runtime did you run
+this on" can affect reproducing exact numbers.
+
+---
+
+## 14. What host runtime does each port need? HF `transformers` vs. vLLM, with examples
+
+**Setup:** llama.cpp and vLLM each need their own port of a model (section
+13) — so what "host runtime" does *HF's* port actually need? And does vLLM
+need its own separate port even for a model already in `transformers`?
+
+**HF `transformers` is self-contained: Python + PyTorch (+ CUDA/cuDNN if
+using GPU), nothing else.** No separate server process, no special runtime.
+Every layer (`Gemma4TextAttention`, `Gemma4TextMLP`, ...) is a plain
+`torch.nn.Module`; `model.generate(...)` just runs a Python script, eagerly,
+calling into PyTorch's C++ core (`libtorch`) for the actual matrix math. This
+is the same stack this project already uses locally — no extra dependency
+beyond what `load_base_model()` in
+[`train.py`](src/train.py#L129-L151) already pulls in via Unsloth's
+`FastModel` wrapper around this same idea.
+
+**vLLM needs its own separate port too, even for a model HF already
+supports.** Confirmed by checking vLLM's model registry directly
+(`vllm/model_executor/models/registry.py`) — it's a dict mapping
+`config.json`'s `"architectures"` string to vLLM's *own* module/class:
+```python
+"Gemma4ForConditionalGeneration": ("gemma4_mm", "Gemma4ForConditionalGeneration"),
+```
+So `"Gemma4ForConditionalGeneration"` is a binding contract (section 11)
+consumed by **two independent implementations** — HF's `modeling_gemma4.py`
+and vLLM's own `gemma4_mm` module — both keyed off the exact same string, but
+neither depending on the other's code.
+
+**How to check whether a given model has vLLM support, in general:**
+1. Easiest: vLLM's [Supported Models docs](https://docs.vllm.ai/en/latest/models/supported_models.html) — searchable, no code needed.
+2. Source-level: grep `registry.py` for the model's `"architectures"` string
+   from its `config.json`. If it's missing, `vllm serve` fails outright with
+   an unsupported-architecture error at load time — no ambiguity.
+
+**Why vLLM bothers re-porting instead of just calling `transformers`:**
+`transformers`' eager Python execution is optimized for *correctness and
+flexibility* (easy to fine-tune/debug/patch — exactly why Unsloth's
+`finetune_*_layers` trick works, section 7), not for serving throughput.
+vLLM's whole reason to exist is rewriting the model's execution into a form
+that adds continuous batching, PagedAttention (efficient KV-cache memory
+layout), and kernel-level optimizations that plain eager PyTorch doesn't do —
+serving many concurrent requests efficiently, not just running one script.
+
+**Example — HF `transformers`, one Python process, no server:**
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("google/gemma-4-E2B", device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-E2B")
+
+messages = [{"role": "user", "content": "Mondj egy viccet magyarul."}]
+inputs = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(model.device)
+
+output = model.generate(inputs, max_new_tokens=200)
+print(tokenizer.decode(output[0], skip_special_tokens=True))
+```
+
+**Example — vLLM, offline batch generation:**
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="google/gemma-4-E2B")
+sampling_params = SamplingParams(max_tokens=200)
+
+outputs = llm.generate(["Mondj egy viccet magyarul."], sampling_params)
+print(outputs[0].outputs[0].text)
+```
+
+**Example — vLLM as an actual server** (OpenAI-compatible HTTP API, the
+typical company-deployment shape):
+```bash
+vllm serve google/gemma-4-E2B --port 8000
+```
+Any OpenAI-client-compatible code then just points `base_url` at
+`http://localhost:8000/v1` — the same pattern this project's own
+`generate_data.py` already uses against its local proxy.
+
+**The practical difference:** the HF snippet is "a script that runs a model
+once." The vLLM snippet is "a serving engine" — batches concurrent requests
+together on the GPU and is what actually sits behind a production API. That
+throughput/flexibility trade-off is the whole reason the second, independent
+port exists at all.
+
+**For this project:** both the T4 training run (3.6) and the "load base +
+attach adapter" deploy story (3.7, section 5) stay in the `transformers`/
+PyTorch runtime — the right call here, since this is a fine-tuning + modest
+demo deploy, not a high-throughput production server where vLLM's trade-offs
+would pay off.
