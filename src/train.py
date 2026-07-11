@@ -79,10 +79,13 @@ SMOKE_MAX_STEPS = 60
 
 # Gemma chat-template turn markers for `train_on_responses_only`: loss is
 # computed only on the model's completion (the gold JSON), with the user turn
-# (instruction + schema + document) masked to -100. These exact strings are
-# required for Gemma 2/3/3n/4 or masking silently zeroes every label.
-GEMMA_INSTRUCTION_PART = "<start_of_turn>user\n"
-GEMMA_RESPONSE_PART = "<start_of_turn>model\n"
+# (instruction + schema + document) masked to -100. Gemma 2/3/3n use
+# "<start_of_turn>user\n" / "<start_of_turn>model\n", but Gemma 4's template
+# renders turns as "<|turn>user\n" / "<|turn>model\n" (confirmed via
+# `tokenizer.apply_chat_template` on unsloth/gemma-4-E2B-it) — using the wrong
+# markers masks every label to -100 and raises in `train_on_responses_only`.
+GEMMA_INSTRUCTION_PART = "<|turn>user\n"
+GEMMA_RESPONSE_PART = "<|turn>model\n"
 
 
 def load_examples(data_dir: Path) -> list[dict[str, Any]]:
@@ -139,6 +142,7 @@ def load_base_model(
 
     `dtype=None` lets Unsloth auto-detect (fp16 on a T4, which has no bf16).
     """
+    import torch
     from unsloth import FastModel
 
     model, tokenizer = FastModel.from_pretrained(
@@ -148,6 +152,24 @@ def load_base_model(
         load_in_4bit=load_in_4bit,
         full_finetuning=False,
     )
+
+    # Gemma 4's per-layer AltUp mechanism (small `per_layer_input_gate` /
+    # `per_layer_projection` / `per_layer_model_projection` modules) computes its
+    # activations in float32 even though Unsloth loads the rest of the model in
+    # float16 on a T4 (no bf16 support). Left as-is, this raises
+    # `RuntimeError: expected mat1 and mat2 to have the same dtype` on the very
+    # first training step. Upcasting just these small modules (not the ~4.7GB
+    # `embed_tokens_per_layer` table, which would OOM a T4) fixes the mismatch
+    # at negligible memory cost (confirmed via forward+backward pass on Colab).
+    for name, module in model.named_modules():
+        if (
+            "per_layer" in name
+            and "embed_tokens_per_layer" not in name
+            and getattr(module, "weight", None) is not None
+            and module.weight.dtype == torch.float16
+        ):
+            module.float()
+
     return model, tokenizer
 
 
