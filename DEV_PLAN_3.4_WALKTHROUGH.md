@@ -203,6 +203,133 @@ The remaining code (`parse_args`, `resolve_max_steps`,
 `resolve_max_steps()` encodes the priority: explicit `--max-steps` wins, else
 `--smoke` uses 60, else train full epochs.
 
+## Part 5: What's actually happening under the hood, one training step
+
+Stations 1-5 assemble the pipeline; this section zooms into what `trainer.train()`
+(inside station 4) is doing on every single step, in SFT terms.
+
+### The core loop (one training example)
+
+The model is an autoregressive next-token predictor: fed a sequence, at *each*
+token position it outputs a probability distribution over the whole vocabulary
+(~262k tokens for Gemma) for "what comes next." One training step is:
+
+1. **Forward pass** — push the example through the network, get a predicted
+   distribution at every position.
+2. **Loss** — at each (unmasked) position, measure how much probability the
+   model gave the *actually correct* next token. Cross-entropy loss:
+   `-log(probability of the correct token)`. High probability on the right
+   token → low loss; low probability → high loss.
+3. **Backward pass (backprop)** — the chain rule run backwards through the
+   network, computing a gradient for every trainable weight: "if I nudge you
+   slightly, does the loss go up or down, and by how much?"
+4. **Optimizer step** — move each weight a small step opposite its gradient,
+   scaled by the learning rate (`2e-4`). This is the actual "nudge toward the
+   correct output."
+
+Repeat for the next example. 450 examples × 3 epochs ≈ hundreds of thousands of
+these tiny nudges, accumulating into learned behavior.
+
+Two refinements specific to this project:
+- **Masking picks which positions count** ([train.py:196](src/train.py#L196),
+  `train_on_responses_only`). Input tokens get label `-100` ("ignore me"), so
+  step 2 only sums loss over the gold-JSON response positions. The model still
+  *reads* the input for context, but is never penalized for how it would've
+  predicted the question.
+- **In LoRA, only the adapter weights actually move.** Steps 1-3 run through the
+  whole model (frozen base + adapter); in step 4, only the ~1% adapter weights
+  get updated — the frozen 4-bit base gets gradients computed *through* it but
+  is never touched. That's the efficiency trick from
+  [Station 2](#station-2--add_lora_adapter-trainpy154).
+
+### One concrete gradient step, with real numbers
+
+A toy example: a 4-token vocabulary, where the correct next token is token #2.
+The model's raw scores (logits) are `[1.0, 2.0, 0.5, 0.0]`:
+
+```python
+import math
+logits = [1.0, 2.0, 0.5, 0.0]
+correct = 2
+lr = 0.5  # exaggerated on purpose, so the move is visible
+
+def softmax(xs):
+    m = max(xs); exps = [math.exp(x - m) for x in xs]; s = sum(exps)
+    return [e / s for e in exps]
+
+p = softmax(logits)                        # [0.213, 0.579, 0.129, 0.078]
+loss = -math.log(p[correct])               # 2.046
+
+# gradient of cross-entropy + softmax has a simple closed form: prob - target
+grad = [p[i] - (1.0 if i == correct else 0.0) for i in range(4)]
+# grad = [0.213, 0.579, -0.871, 0.078]
+
+new_logits = [logits[i] - lr * grad[i] for i in range(4)]
+p2 = softmax(new_logits)
+loss2 = -math.log(p2[correct])
+```
+
+Result:
+
+| | before | after |
+|---|---|---|
+| probs | `[0.213, 0.579, 0.129, 0.078]` | `[0.213, 0.482, 0.222, 0.084]` |
+| prob on correct (#2) | 0.129 | 0.222 |
+| loss | 2.046 | 1.506 |
+
+Reading it: the model initially favored token #1 (0.579) over the correct
+token #2 (0.129) — wrong. The gradient on the correct token's logit is
+negative (`-0.871`, "push this **up**"), and positive on the others ("push
+these **down**"). After one step, the correct token's probability rose to
+0.222 and loss dropped. **That's one nudge.**
+
+In the real run, `lr=2e-4` (not `0.5`), so each move is microscopic — the toy
+example uses a big learning rate purely so the shift is visible. And the
+logits aren't free parameters; they're the network's output, so the gradient
+flows further back into the LoRA adapter's `B`/`A` matrices via the chain
+rule — but the *shape* of the story (predict → measure surprise → assign
+blame → nudge) is exactly this.
+
+### Why per-token prediction is enough to learn structured output
+
+We never explicitly teach the model "JSON has braces" or "there's a
+`patient_name` field." We only ever do the tiny step above, at every position.
+Structure emerges anyway, because:
+
+1. **Structure is just high-probability token sequences.** "Valid JSON matching
+   our schema" is mechanically nothing more than certain tokens being very
+   likely to follow certain other tokens. After `{` comes `"`. After
+   `"patient_name"` comes `:`. A good-enough next-token predictor **is** a JSON
+   generator — no separate "structure module" needed.
+
+2. **Each position teaches a different sub-skill, for free.** Loss is computed
+   at *every* response position, so one example is really ~200 mini-lessons:
+   position after `{` → "start with a key, in schema order"; position after
+   `"patient_name":` → "**copy** the name from the document" (the real content
+   skill); position where a field is absent → "emit `null`, don't hallucinate";
+   position after the last field → "close with `}` and stop." None of these
+   were designed by hand — they fall out of grading each token against the
+   gold JSON.
+
+3. **Consistency across examples turns "memorized" into "learned."** If only
+   one example ended with `}`, the model might just memorize that specific
+   case. But *every* gold JSON follows the schema's key order — exactly why
+   `serialize_gold()` forces key order
+   ([prompt_format.py:34](src/prompt_format.py#L34)) instead of using the
+   source JSONL's arbitrary order. The "after `{` comes the first schema key"
+   nudge points the *same direction* across all 430 examples. Repeated,
+   consistent nudges compound into a robust rule; inconsistent ones would
+   cancel out.
+
+4. **Masking keeps the signal pure.** Because input tokens are masked, no
+   nudge is ever spent on reproducing the *question* — all learning capacity
+   goes to "given this document, produce this JSON."
+
+**The synthesis:** structured output isn't a special training mode — it's what
+you get from ordinary per-token prediction on examples whose targets are
+consistently structured. The schema lives in the *data*; per-token prediction
+absorbs it one nudge at a time.
+
 ## The one-sentence summary
 
 **3.4 wires up a 5-stage pipeline — load frozen 4-bit Gemma → attach a tiny LoRA
