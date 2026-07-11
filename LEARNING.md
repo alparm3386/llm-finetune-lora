@@ -18,6 +18,8 @@
 8. [Open weight vs. open source, and reading a real config.json](#8-open-weight-vs-open-source-and-reading-a-real-configjson)
 9. [3.4.1 — what one training example actually looks like (`prompt_format.py`)](#9-341--what-one-training-example-actually-looks-like-prompt_formatpy)
 10. [A checklist for reading any new model's config.json](#10-a-checklist-for-reading-any-new-models-configjson)
+11. [`architectures` names a real class — config numbers plug into hand-written code, not the other way around](#11-architectures-names-a-real-class--config-numbers-plug-into-hand-written-code-not-the-other-way-around)
+12. [Peeking at `modeling_gemma4.py`: how complex is it, really?](#12-peeking-at-modeling_gemma4py-how-complex-is-it-really)
 
 ---
 
@@ -670,3 +672,122 @@ require manual judgment — Unsloth already knows Gemma's internals, so LoRA
 target shapes don't need to be hand-derived. This whole checklist matters most
 for a genuinely new/obscure architecture Unsloth doesn't have a preset for,
 where you'd write a `target_modules` list by hand instead.
+
+---
+
+## 11. `architectures` names a real class — config numbers plug into hand-written code, not the other way around
+
+**Setup:** so is `"Gemma4ForConditionalGeneration"` just an arbitrary label in
+`config.json`, or does the architecture somehow get built up automatically
+from the config's numbers?
+
+**Short answer: neither extreme — it's a binding pointer to a real,
+hand-written Python class that must already exist in `transformers`, and that
+class defines *how* computation happens; the config only supplies the
+*numbers* that get plugged into it.**
+
+**The rough end-to-end procedure, extending [section 6](#6-why-pytorchhf-instead-of-the-original-framework-jax-a-model-was-trained-in)'s dependency chain:**
+1. Google designs the architecture and trains the weights internally, in JAX
+   (often via Flax).
+2. Someone — usually Google's own team working directly with Hugging Face
+   around release day (not a random outside guess, though for smaller/community
+   models it genuinely can be an external contributor) — **hand-ports** that
+   architecture's math into a new PyTorch class, e.g. `Gemma4ForConditionalGeneration`,
+   added to the `transformers` library.
+3. That class ships in a `transformers` release; `config.json`'s
+   `"architectures"` field names it exactly, as a contract: "the code that
+   runs this checkpoint is the class of this exact name, in this library."
+
+**Why the class — not the config — is where the architecture actually lives:**
+`config.json` is pure data (`hidden_size: 1536`, `num_attention_heads: 8`, ...)
+— numbers with no information about *how* they're used. The class is
+hand-written code that says things like:
+
+```python
+class Gemma4Attention(nn.Module):
+    def __init__(self, config):
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim)
+        ...
+    def forward(self, x):
+        q = self.q_proj(x)
+        # rotary embeddings, sliding-window mask, attention math...
+```
+
+The config's numbers get **plugged into** an already-designed structure
+(matrix sizes, how many blocks to stack) — but *that there's a `q_proj` at
+all, that attention alternates sliding/full every 5th layer, the exact RoPE
+formula per layer type* (all from [section 8](#8-open-weight-vs-open-source-and-reading-a-real-configjson)'s
+worked example) is logic someone wrote by hand, matching Google's original JAX
+implementation's math. None of that is derivable from the config alone.
+
+**The stakes of getting the port wrong:** if the hand-written class's math
+doesn't exactly match the original JAX implementation (e.g. a slightly
+different RoPE formula, or attention masking off-by-one), the ported model can
+silently produce different — often subtly worse — outputs than the original,
+*even with the exact original weights loaded in*. Loading succeeds, no error
+is raised, the model just quietly behaves a bit wrong. This is why widely-used
+ports (major model families) get heavy scrutiny and cross-checking against
+reference outputs before release — the port is the fragile, easy-to-get-wrong
+step, not the config.
+
+**One-line summary:** config = "what sizes to plug in," class = "the actual
+computation graph." Two genuinely separate artifacts; the second one is the
+hard, hand-written part, not something auto-derived from the first.
+
+---
+
+## 12. Peeking at `modeling_gemma4.py`: how complex is it, really?
+
+**Setup:** having established the class (not the config) defines the
+architecture (section 11), what does that class actually look like — and is
+it too complex to realistically understand?
+
+**Scale:** `modeling_gemma4.py` on the `transformers` GitHub repo is roughly
+**2,650 lines, 34 classes**. That's a lot for "one model" — but it's not one
+Transformer, it's **three cohabiting in one file**: text, vision, and audio,
+each with their own attention/MLP/embedding classes, plus glue code merging
+them into one sequence.
+
+**Rough breakdown by tower:**
+
+| Tower | Key classes | What's distinctive |
+|---|---|---|
+| **Text** | `Gemma4TextAttention`, `Gemma4TextMLP`, `Gemma4TextDecoderLayer`, `Gemma4TextRotaryEmbedding`, plus `Gemma4TextExperts`/`Gemma4TextRouter` | The MoE routing classes exist in code but are dead for this checkpoint (`enable_moe_block: false`, section 10) — alive for a bigger sibling model in the family. Handles the sliding/full attention split + per-layer RoPE seen in the config (section 8). |
+| **Vision** | `Gemma4VisionAttention`, `Gemma4VisionMLP`, `Gemma4VisionPatchEmbedder`, `Gemma4VisionRotaryEmbedding` | Uses **2D** rotary embeddings (images need x/y position, not just sequence position) — genuinely different math from text RoPE, not just a relabeled copy. |
+| **Audio** | `Gemma4AudioAttention`, `Gemma4AudioFeedForward`, `Gemma4AudioCausalConv1d`, `Gemma4AudioSubSampleConvProjection` | Convolution layers *before* attention, subsampling raw audio to a manageable sequence length — a different architectural family (CNN-then-Transformer) bolted on. |
+| **Glue** | `Gemma4MultimodalEmbedder`, various `*Output` dataclasses | Merges token/image/audio embeddings into one sequence before the text decoder runs. |
+
+**A concrete illustration of section 11's point** — this attention snippet
+has zero corresponding config.json field:
+```python
+query_states = self.q_proj(hidden_states).view(hidden_shape)
+query_states = self.q_norm(query_states)
+query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
+```
+That `q_norm` (normalizing queries before applying rotary embeddings) is a
+Gemma-family stability trick — hand-written logic, not derivable from any
+config number.
+
+**Is this too complex to understand?** No — the *scale* is mostly repetition,
+not novel ideas:
+- Once you understand one attention block (q/k/v/o proj → RoPE → softmax →
+  weighted sum), you've understood most of `Gemma4TextAttention`,
+  `Gemma4VisionAttention`, and `Gemma4AudioAttention` — variations on one
+  theme, not three unrelated concepts. The `*Output` dataclasses are just
+  "named bags of tensors," no logic at all.
+- The genuinely novel ~20% is small and individually well-documented:
+  `q_norm`, 2D vs. 1D RoPE, causal 1D convolutions before audio attention,
+  MoE routing. Each is a nameable, googleable concept with a paper behind it
+  — you don't hold all 2,650 lines in your head, you pattern-match "oh, this
+  is the RoPE part."
+- Practically, none of this needs reading to *use* the model — that's the
+  whole point of `AutoModelForCausalLM.from_pretrained()` + Unsloth (section
+  5): someone already verified this code matches Google's original math, so
+  it's a black box (text/audio/image in, text out) for everyday use.
+  Cracking it open here was pure curiosity, not something `train.py` requires.
+
+**Caveat on this section:** fetched via a summarizing web-fetch tool rather
+than a raw file read, so treat exact line counts/snippets as "probably right"
+rather than verified — worth a direct read of the source if this ever matters
+for real debugging.
