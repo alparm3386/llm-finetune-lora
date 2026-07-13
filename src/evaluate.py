@@ -19,18 +19,21 @@ Sub-step status within this file:
   3.5.2 eval-data loading      — done
   3.5.3 inference model loading — done
   3.5.4 generation (2 paths)    — done
-  3.5.5 eval loop + aggregation — TODO
-  3.5.6 reporting               — TODO
-  3.5.7 CLI                      — TODO
+  3.5.5 eval loop + aggregation — done
+  3.5.6 reporting               — done
+  3.5.7 CLI                      — done
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from eval_metrics import aggregate_field_scores, parse_prediction, score_example, validity_rate
 from prompt_format import to_chat_messages
 from schemas import SCHEMAS
 from train import DEFAULT_MODEL_NAME, MAX_SEQ_LENGTH, upcast_gemma_per_layer_modules
@@ -41,6 +44,11 @@ from validate_eval_set import (
     load_domain_examples,
     validate_example,
 )
+
+# The four cells of the 2x2 (locked naming used throughout the eval loop,
+# reporting, and CLI).
+MODEL_VARIANTS = ("base", "fine_tuned")
+DECODE_MODES = ("prompt_only", "structured")
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -214,10 +222,350 @@ def generate_structured(
     return generator(prompt, max_new_tokens=max_new_tokens, do_sample=False)
 
 
-def main() -> None:
-    raise NotImplementedError(
-        "Step 3.5: eval loop not yet wired (sub-steps 3.5.5–3.5.7 in progress)"
+# --- 3.5.5: eval loop + aggregation --------------------------------------------
+
+
+def apply_limit(examples: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    """Truncate to the first `limit` examples, or return all of them if `limit` is None.
+
+    Used by the CLI's `--limit` for a fast shakeout of the loop/plumbing without
+    waiting on a full-set GPU run.
+    """
+    return examples if limit is None else examples[:limit]
+
+
+def generate_predictions(
+    model: Any,
+    tokenizer: Any,
+    examples: list[dict[str, Any]],
+    mode: str,
+    structured_generators: dict[str, Any] | None = None,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    seed: int = 0,
+) -> list[dict[str, Any]]:
+    """Run one decode mode over every example, returning raw + parsed predictions.
+
+    `mode` is `"prompt_only"` (needs just `model`/`tokenizer`) or `"structured"`
+    (needs `structured_generators`, one per domain, from
+    `build_structured_generators`). Every example gets the identical prompt from
+    `build_inference_prompt` (decision A). Parsing (`eval_metrics.parse_prediction`)
+    happens here for both modes: prompt-only output may be unparseable (`pred`
+    becomes `None`, scored as decision A's empty-prediction case); structured
+    output is schema-valid JSON by construction, so parsing only recovers the dict.
+    """
+    predictions: list[dict[str, Any]] = []
+    for example in examples:
+        prompt = build_inference_prompt(tokenizer, example["domain"], example["document"])
+        if mode == "prompt_only":
+            raw_text = generate_prompt_only(model, tokenizer, prompt, max_new_tokens, seed)
+        elif mode == "structured":
+            generator = structured_generators[example["domain"]]
+            raw_text = generate_structured(generator, prompt, max_new_tokens, seed)
+        else:
+            raise ValueError(f"Unknown decode mode: {mode!r}")
+        pred = parse_prediction(raw_text)
+        predictions.append(
+            {"domain": example["domain"], "raw_text": raw_text, "pred": pred, "valid": pred is not None}
+        )
+    return predictions
+
+
+def score_predictions(
+    examples: list[dict[str, Any]], predictions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Score one cell's predictions against gold: per-field F1 (all aggregation
+    levels, via `eval_metrics.aggregate_field_scores`) plus JSON validity rate.
+
+    F1 is meaningful in every cell (decision A: "F1 is reported in all four
+    cells"); validity rate is only informative for `prompt_only` cells (structured
+    output is always valid by construction), but is included everywhere for
+    uniformity — the reporting step (3.5.6) picks which numbers to surface.
+    """
+    records = [
+        (ex["domain"], score_example(SCHEMAS[ex["domain"]], ex["gold"], pred["pred"]))
+        for ex, pred in zip(examples, predictions)
+    ]
+    return {
+        "f1": aggregate_field_scores(records),
+        "validity_rate": validity_rate([p["valid"] for p in predictions]),
+    }
+
+
+def run_eval_cell(
+    model: Any,
+    tokenizer: Any,
+    examples: list[dict[str, Any]],
+    mode: str,
+    structured_generators: dict[str, Any] | None = None,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Generate + score one cell of the 2x2 (one model variant x one decode mode)."""
+    predictions = generate_predictions(
+        model, tokenizer, examples, mode, structured_generators, max_new_tokens, seed
     )
+    return score_predictions(examples, predictions)
+
+
+def run_evaluation(
+    base_model: Any,
+    base_tokenizer: Any,
+    fine_tuned_model: Any,
+    fine_tuned_tokenizer: Any,
+    examples: list[dict[str, Any]],
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    seed: int = 0,
+    structured_only: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Assemble the full 2x2: {base, fine_tuned} x {prompt_only, structured}.
+
+    Keyed `"{variant}.{mode}"` (e.g. `"fine_tuned.structured"`), each value the
+    `score_predictions` result for that cell. `structured_only=True` skips the
+    `prompt_only` cells (CLI `--structured-only`, for faster iteration — the
+    +structured cells carry the headline F1 metric).
+
+    Structured generators are built once per model variant (schema-index
+    compilation is the expensive part — see `build_structured_generators`), then
+    reused across all examples in that variant's structured cell.
+    """
+    results: dict[str, dict[str, Any]] = {}
+    variants = [
+        ("base", base_model, base_tokenizer),
+        ("fine_tuned", fine_tuned_model, fine_tuned_tokenizer),
+    ]
+    for variant_name, model, tokenizer in variants:
+        structured_generators = build_structured_generators(model, tokenizer)
+        results[f"{variant_name}.structured"] = run_eval_cell(
+            model, tokenizer, examples, "structured", structured_generators, max_new_tokens, seed
+        )
+        if not structured_only:
+            results[f"{variant_name}.prompt_only"] = run_eval_cell(
+                model, tokenizer, examples, "prompt_only", None, max_new_tokens, seed
+            )
+    return results
+
+
+# --- 3.5.6: reporting -----------------------------------------------------------
+
+
+def _fmt_f1(value: float) -> str:
+    return f"{value:.3f}"
+
+
+def _fmt_percent(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def build_results_payload(
+    results: dict[str, dict[str, Any]], metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Wrap the raw 2x2 `run_evaluation` output with run metadata, for `eval_results.json`.
+
+    `results` already carries the full per-cell / per-domain / per-field
+    breakdown (nested inside each cell's `f1`, via
+    `eval_metrics.aggregate_field_scores`) — decision D's "reproducibility" ask —
+    so this just adds the run parameters (models, seed, sizes, timestamp) needed
+    to interpret a saved run later.
+    """
+    return {"metadata": metadata, "results": results}
+
+
+def render_2x2_table(results: dict[str, dict[str, Any]]) -> str:
+    """Render the headline 2x2 (decode mode x model variant) as a markdown table.
+
+    Overall F1 appears in every cell (decision D: "F1 is reported in all four
+    cells"); validity rate is added only to the prompt-only row (decision D's
+    secondary metric — structured output is always valid by construction).
+    """
+    lines = ["| Decode mode | Base | Fine-tuned |", "|---|---|---|"]
+    for mode_label, mode_key in [("Prompt-only", "prompt_only"), ("+Structured decoding", "structured")]:
+        cells = []
+        for variant in MODEL_VARIANTS:
+            cell = results.get(f"{variant}.{mode_key}")
+            if cell is None:
+                cells.append("—")
+                continue
+            f1 = _fmt_f1(cell["f1"]["overall"]["f1"])
+            if mode_key == "prompt_only":
+                cells.append(f"F1 {f1}, valid {_fmt_percent(cell['validity_rate'])}")
+            else:
+                cells.append(f"F1 {f1}")
+        lines.append(f"| {mode_label} | {cells[0]} | {cells[1]} |")
+    return "\n".join(lines)
+
+
+def render_per_domain_table(
+    results: dict[str, dict[str, Any]], mode_key: str = "structured"
+) -> str:
+    """Render per-domain F1 (base vs. fine-tuned) for one decode mode, default +structured."""
+    domains = sorted(
+        {
+            domain
+            for variant in MODEL_VARIANTS
+            for domain in results.get(f"{variant}.{mode_key}", {}).get("f1", {}).get("per_domain", {})
+        }
+    )
+    lines = ["| Domain | Base F1 | Fine-tuned F1 |", "|---|---|---|"]
+    for domain in domains:
+        row = [domain]
+        for variant in MODEL_VARIANTS:
+            cell = results.get(f"{variant}.{mode_key}")
+            per_domain = cell["f1"]["per_domain"] if cell else {}
+            row.append(_fmt_f1(per_domain[domain]["f1"]) if domain in per_domain else "—")
+        lines.append(f"| {row[0]} | {row[1]} | {row[2]} |")
+    return "\n".join(lines)
+
+
+def build_eval_table_markdown(results: dict[str, dict[str, Any]]) -> str:
+    """Build the full `eval_table.md` content: headline sentence + 2x2 + per-domain breakdown.
+
+    The headline compares fine-tuned/+structured vs. base/+structured F1 (decision
+    D: "the *headline* number is fine-tuned/+structured vs. base/+structured"),
+    since structured decoding controls for format on both sides.
+    """
+    lines = ["# Evaluation results", ""]
+    base_structured = results.get("base.structured")
+    ft_structured = results.get("fine_tuned.structured")
+    if base_structured and ft_structured:
+        base_f1 = _fmt_f1(base_structured["f1"]["overall"]["f1"])
+        ft_f1 = _fmt_f1(ft_structured["f1"]["overall"]["f1"])
+        lines.append(f"**Headline (+structured decoding): base F1 {base_f1} → fine-tuned F1 {ft_f1}.**")
+        lines.append("")
+    lines.append(render_2x2_table(results))
+    if "base.structured" in results or "fine_tuned.structured" in results:
+        lines.extend(["", "## Per-domain F1 (+structured decoding)", "", render_per_domain_table(results)])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_eval_results(
+    results: dict[str, dict[str, Any]],
+    metadata: dict[str, Any],
+    results_json_path: Path,
+    results_table_path: Path,
+) -> None:
+    """Write both reporting outputs (decision D), creating parent directories as needed."""
+    results_json_path.parent.mkdir(parents=True, exist_ok=True)
+    results_json_path.write_text(
+        json.dumps(build_results_payload(results, metadata), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    results_table_path.parent.mkdir(parents=True, exist_ok=True)
+    results_table_path.write_text(build_eval_table_markdown(results), encoding="utf-8")
+
+
+def log_summary(results: dict[str, dict[str, Any]]) -> None:
+    """Log one readable line per cell: overall F1 and JSON validity rate."""
+    for key in (f"{variant}.{mode}" for variant in MODEL_VARIANTS for mode in DECODE_MODES):
+        cell = results.get(key)
+        if cell is None:
+            continue
+        logger.info(
+            "%-24s F1=%s  validity=%s",
+            key,
+            _fmt_f1(cell["f1"]["overall"]["f1"]),
+            _fmt_percent(cell["validity_rate"]),
+        )
+
+
+# --- 3.5.7: CLI -------------------------------------------------------------------
+
+DEFAULT_RESULTS_DIR = "results"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Before/after evaluation: base vs. fine-tuned (base + LoRA adapter) on "
+            "the real, hand-labeled Hungarian eval set, at {prompt-only, +structured "
+            "decoding}."
+        )
+    )
+    parser.add_argument(
+        "--adapter",
+        required=True,
+        help="Path to the trained LoRA adapter directory (train.py's --out).",
+    )
+    parser.add_argument(
+        "--base-model",
+        default=DEFAULT_BASE_MODEL,
+        help=f"Base model to load (default: {DEFAULT_BASE_MODEL}).",
+    )
+    parser.add_argument(
+        "--eval-dir",
+        default=DEFAULT_EVAL_DIR,
+        help=f"Directory of per-domain hand-labeled eval JSONL files (default: {DEFAULT_EVAL_DIR}).",
+    )
+    parser.add_argument(
+        "--out",
+        default=DEFAULT_RESULTS_DIR,
+        help=f"Output directory for eval_results.json / eval_table.md (default: {DEFAULT_RESULTS_DIR}).",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=DEFAULT_MAX_NEW_TOKENS,
+        help=f"Max new tokens per generation (default: {DEFAULT_MAX_NEW_TOKENS}).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Evaluate only the first N eval examples (default: all — quick shakeout with a small N).",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0).")
+    parser.add_argument(
+        "--structured-only",
+        action="store_true",
+        help="Skip the prompt-only cells and run only +structured decoding (faster iteration).",
+    )
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = parse_args()
+
+    examples = apply_limit(load_eval_examples(Path(args.eval_dir)), args.limit)
+    logger.info("Loaded %d eval examples from %s", len(examples), args.eval_dir)
+
+    logger.info("Loading base model %s...", args.base_model)
+    base_model, base_tokenizer = load_inference_model(args.base_model)
+
+    logger.info("Loading fine-tuned model (adapter %s)...", args.adapter)
+    fine_tuned_model, fine_tuned_tokenizer = load_inference_model(
+        args.base_model, adapter_dir=args.adapter
+    )
+
+    results = run_evaluation(
+        base_model,
+        base_tokenizer,
+        fine_tuned_model,
+        fine_tuned_tokenizer,
+        examples,
+        max_new_tokens=args.max_new_tokens,
+        seed=args.seed,
+        structured_only=args.structured_only,
+    )
+
+    log_summary(results)
+
+    metadata = {
+        "base_model": args.base_model,
+        "adapter": args.adapter,
+        "eval_dir": args.eval_dir,
+        "num_examples": len(examples),
+        "seed": args.seed,
+        "max_new_tokens": args.max_new_tokens,
+        "limit": args.limit,
+        "structured_only": args.structured_only,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    out_dir = Path(args.out)
+    results_json_path = out_dir / "eval_results.json"
+    results_table_path = out_dir / "eval_table.md"
+    write_eval_results(results, metadata, results_json_path, results_table_path)
+    logger.info("Wrote %s and %s", results_json_path, results_table_path)
 
 
 if __name__ == "__main__":

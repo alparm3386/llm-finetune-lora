@@ -123,19 +123,19 @@ integration is non-trivial):
   JSON parse (reuse `strip_json_fence` idea from `generate_data.py`); (b)
   `outlines` schema-constrained. Both reuse `prompt_format`. See decision B
   risks — **fetch current outlines docs via context7 before writing.**
-- [ ] **3.5.5** `Sonnet` — Eval loop + aggregation: for each {base, ft} ×
+- [x] **3.5.5** `Sonnet` — Eval loop + aggregation: for each {base, ft} ×
   {prompt-only, structured}, run all eval docs, call `eval_metrics` → assemble
   the 2×2 (per-domain + overall). `--limit` for quick shakeouts.
-- [ ] **3.5.6** `Sonnet` — Reporting: write `results/eval_results.json` +
+- [x] **3.5.6** `Sonnet` — Reporting: write `results/eval_results.json` +
   `results/eval_table.md` (2×2), and log a readable summary. F1 in all cells,
   validity rate in the prompt-only cells.
-- [ ] **3.5.7** `Sonnet` — CLI: argparse — `--adapter`, `--base-model`,
+- [x] **3.5.7** `Sonnet` — CLI: argparse — `--adapter`, `--base-model`,
   `--eval-dir`, `--out`, `--max-new-tokens`, `--limit`, `--seed`, and a switch to
   skip a mode (e.g. `--structured-only`) for faster iteration.
-- [ ] **3.5.8** `Sonnet` — `notebooks/eval_colab.ipynb`: thin Colab wrapper —
+- [x] **3.5.8** `Sonnet` — `notebooks/eval_colab.ipynb`: thin Colab wrapper —
   load adapter (from 3.6 output or HF Hub) + run `evaluate.py`, mirroring
   `train_colab.ipynb`.
-- [ ] **3.5.9** `Sonnet` — Local unit tests: `tests/test_eval_metrics.py` (the
+- [x] **3.5.9** `Sonnet` — Local unit tests: `tests/test_eval_metrics.py` (the
   meat — hand-built cases for TP/FP/FN, nulls, hallucinations, wrong values,
   array set-F1, unparseable preds, normalization), plus eval-data-loading and
   CLI-parsing tests. Full GPU eval run is part of **3.6**.
