@@ -24,6 +24,7 @@
 14. [What host runtime does each port need? HF `transformers` vs. vLLM, with examples](#14-what-host-runtime-does-each-port-need-hf-transformers-vs-vllm-with-examples)
 15. [Is HF `transformers` just for experiments, and vLLM for prod?](#15-is-hf-transformers-just-for-experiments-and-vllm-for-prod)
 16. [Deploying a LoRA adapter via vLLM](#16-deploying-a-lora-adapter-via-vllm)
+17. [What's in a checkpoint zip, PEFT vs. Unsloth, and what deployment actually needs](#17-whats-in-a-checkpoint-zip-peft-vs-unsloth-and-what-deployment-actually-needs)
 
 ---
 
@@ -1037,3 +1038,115 @@ support requires target modules it knows how to handle — standard
 decision E's target modules, section 7) are well-supported, so no conflict
 with the current setup. If the target modules ever changed to something
 unusual, that would be the first thing to check against vLLM's LoRA docs.
+
+---
+
+## 17. What's in a checkpoint zip, PEFT vs. Unsloth, and what deployment actually needs
+
+**Setup:** a first real adapter zip out of a Colab run turned out to be 380 MB
+uncompressed to 500 MB — surprisingly large for something described as a
+"tiny" LoRA adapter (section 1). Unpacking why, and what a checkpoint even
+is, led into PEFT and Unsloth's actual relationship.
+
+### What is a "checkpoint," generally?
+
+A saved snapshot of training state, not just the model weights. Three things
+bundled together:
+- **Weights** — the actual learned parameters (here: just the LoRA adapter's
+  `B`/`A` matrices, section 7 — the frozen base isn't re-saved).
+- **Optimizer state** (`optimizer.pt`) — AdamW's per-weight momentum/variance
+  buffers. Needed only to *resume* training with correct momentum; irrelevant
+  for inference.
+- **Metadata** (`trainer_state.json`, `rng_state.pth`, `training_args.bin`) —
+  step/epoch counters, RNG state, the config used. Also resume-only.
+
+Checkpoints exist so a training run can survive interruption (Colab
+disconnects, T4 session timeouts) without losing hours of progress, and so
+you can pick the best-performing checkpoint rather than assuming the last one
+is best.
+
+### Why the zip was 380 MB, not ~100 MB
+
+Inspecting it (`zipfile` + `trainer_state.json`) showed **three full copies**
+of the adapter bundled together: the final `adapter_model.safetensors`
+(101 MB) plus two rolling training checkpoints (`checkpoint-140`,
+`checkpoint-159`), each *also* containing their own 101 MB adapter weights,
+50 MB `optimizer.pt`, and 32 MB `tokenizer.json`. None of that duplication was
+a bug — `SAVE_STEPS = 20` / `SAVE_TOTAL_LIMIT = 2` at
+[`train.py:72-74`](src/train.py#L72-L74) intentionally keeps the 2 most
+recent periodic checkpoints as a resume safety net — it's just that the
+*deployment* zip shouldn't also carry that resume scaffolding.
+
+**Why `checkpoint-159` isn't a round multiple of `SAVE_STEPS=20`:** the HF
+`Trainer` always does one extra save at the true end of training, regardless
+of `save_steps` alignment. `trainer_state.json` confirmed
+`global_step == max_steps == 159`, `epoch: 3.0` — training simply finished at
+step 159 (`≈ ceil(train_examples / effective_batch_size) × epochs`, with
+`effective_batch_size = PER_DEVICE_TRAIN_BATCH_SIZE × GRAD_ACCUM_STEPS = 2×4 = 8`),
+so `checkpoint-140` (last periodic multiple of 20) and `checkpoint-159`
+(final, off-grid) are both legitimate, not a sign anything is missing.
+
+**Is 101 MB itself reasonable for an r=16 adapter?** Yes, given
+`finetune_mlp_modules=True` at [`train.py:192`](src/train.py#L192) — LoRA is
+applied to MLP projections (`gate`/`up`/`down`, the widest matrices in a
+Transformer block, section 7's MLP note) in addition to attention, which is
+"decision E," a deliberate accuracy/size tradeoff, not an oversight.
+
+### What deployment actually needs
+
+Minimal set to `PeftModel.from_pretrained(base, adapter_dir)`:
+- `adapter_model.safetensors` — the weights.
+- `adapter_config.json` — tells PEFT which base model to attach to, and the
+  `r`/`alpha`/target-modules shape; without it the safetensors file is just
+  unlabeled numbers.
+
+Worth keeping alongside for exact reproducibility (guards against tokenizer/
+chat-template drift vs. the base model on the Hub), but not strictly required
+to load the adapter itself: `tokenizer.json`, `tokenizer_config.json`,
+`chat_template.jinja`.
+
+Skip entirely for a deploy bundle: `processor_config.json` (vision-processor
+config — irrelevant, `finetune_vision_layers=False`), `README.md`
+(auto-generated model card, no functional role), and everything under
+`checkpoints/*` (`optimizer.pt`, `rng_state.pth`, `trainer_state.json`,
+`training_args.bin` — resume-only state). That trims the ~380 MB zip down to
+roughly the ~101 MB adapter + ~32 MB tokenizer ≈ **~134 MB** for something
+actually deployable.
+
+### PEFT vs. Unsloth — what each one is actually doing
+
+**PEFT** = **P**arameter-**E**fficient **F**ine-**T**uning — Hugging Face's
+library (and the umbrella term) for the whole family of "train a small
+subset of parameters, freeze the rest" techniques. LoRA (section 1, section
+7) is one method in that family; others include prefix tuning, prompt
+tuning, (IA)³, and classic bottleneck adapters. PEFT defines *what* to
+train: the `LoraConfig`, which named modules get wrapped, the resulting
+`adapter_config.json`/`adapter_model.safetensors` artifact shape.
+
+**Unsloth doesn't replace PEFT — it's an optimization layer wrapping it.**
+`FastModel.get_peft_model(...)` at [`train.py:187`](src/train.py#L187) still
+produces a standard PEFT `LoraConfig`/adapter under the hood; Unsloth just
+constructs it through hand-written Triton/CUDA kernels and manually-derived
+backward passes instead of generic PyTorch autograd, claiming ~2x faster
+training and much lower VRAM for the LoRA+quantized-model combination
+specifically. That's *why* a T4 (16 GB) is enough here — plain
+`transformers`+`peft`+`bitsandbytes` would likely be slower and might not
+even fit `gemma-4-E2B` (multimodal, plus MLP-included LoRA, section 10's
+composite-tower point) in that budget, not just "would run a bit slower."
+
+Concretely, everything Unsloth touches in `train.py` is a drop-in
+accelerator over a standard piece:
+
+| Unsloth call | Standard equivalent it wraps |
+|---|---|
+| `FastModel.get_peft_model(...)` ([`train.py:187`](src/train.py#L187)) | `peft.get_peft_model(model, LoraConfig(...))` |
+| `load_base_model` (Unsloth's `FastModel.from_pretrained`) | `transformers.AutoModelForCausalLM.from_pretrained(..., quantization_config=BitsAndBytesConfig(load_in_4bit=True))` |
+| `use_gradient_checkpointing="unsloth"` ([`train.py:197`](src/train.py#L197)) | `gradient_checkpointing=True` on `TrainingArguments`/`SFTConfig` (Unsloth's variant claims extra VRAM savings) |
+| `train_on_responses_only` | hand-rolled loss-masking of the prompt tokens (same effect, more boilerplate) |
+
+**The output stays portable either way.** Because Unsloth produces a
+standard PEFT adapter, the saved `adapter_model.safetensors` +
+`adapter_config.json` load with plain `PeftModel.from_pretrained` later —
+Unsloth is a *training-time* accelerator, not a runtime dependency for
+inference/deployment (section 5, section 16's vLLM deploy path needs no
+Unsloth at all).

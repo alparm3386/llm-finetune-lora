@@ -100,7 +100,7 @@ integration is non-trivial):
 
 ## Sub-steps
 
-- [ ] **3.5.0** `Sonnet` — Eval-set scaffolding (the dedicated eval-data step —
+- [x] **3.5.0** `Sonnet` — Eval-set scaffolding (the dedicated eval-data step —
   see Dependencies): write `data/eval/README.md` (a labeling guide: sourcing
   real OGYÉI leaflets / business news / tech specs, PII-free, the
   `{domain, document, gold}` JSONL format, per-domain gold examples) + a small
@@ -112,7 +112,7 @@ integration is non-trivial):
   array TP/FP/FN classification (per decision A), micro-F1 aggregation
   (overall/per-domain/per-field), `is_valid_json` / schema-validity check. Pure
   functions, no model deps.
-- [ ] **3.5.2** `Sonnet` — Eval-data loading in `evaluate.py`: read
+- [x] **3.5.2** `Sonnet` — Eval-data loading in `evaluate.py`: read
   `data/eval/{domain}.jsonl` (reuse the `{domain, document, gold}` shape; can
   share `load_examples` logic with `train.py`). Clear error if the eval set is
   absent (see Dependencies).
