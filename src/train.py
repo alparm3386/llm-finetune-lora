@@ -128,6 +128,34 @@ def build_dataset(
     return split["train"], split["test"]
 
 
+def upcast_gemma_per_layer_modules(model: Any) -> None:
+    """Upcast Gemma 4's small per-layer AltUp modules to float32, in place.
+
+    Gemma 4's per-layer AltUp mechanism (small `per_layer_input_gate` /
+    `per_layer_projection` / `per_layer_model_projection` modules) computes its
+    activations in float32 even though Unsloth loads the rest of the model in
+    float16 on a T4 (no bf16 support). Left as-is, this raises
+    `RuntimeError: expected mat1 and mat2 to have the same dtype` on the very
+    first forward pass. Upcasting just these small modules (not the ~4.7GB
+    `embed_tokens_per_layer` table, which would OOM a T4) fixes the mismatch at
+    negligible memory cost (confirmed via forward+backward pass on Colab). Needed
+    for both training (`train.py`) and inference (`evaluate.py`), so it's a shared
+    helper.
+
+    `torch` is imported lazily so this stays out of the module's import-time deps.
+    """
+    import torch
+
+    for name, module in model.named_modules():
+        if (
+            "per_layer" in name
+            and "embed_tokens_per_layer" not in name
+            and getattr(module, "weight", None) is not None
+            and module.weight.dtype == torch.float16
+        ):
+            module.float()
+
+
 def load_base_model(
     model_name: str = DEFAULT_MODEL_NAME,
     max_seq_length: int = MAX_SEQ_LENGTH,
@@ -142,7 +170,6 @@ def load_base_model(
 
     `dtype=None` lets Unsloth auto-detect (fp16 on a T4, which has no bf16).
     """
-    import torch
     from unsloth import FastModel
 
     model, tokenizer = FastModel.from_pretrained(
@@ -153,22 +180,7 @@ def load_base_model(
         full_finetuning=False,
     )
 
-    # Gemma 4's per-layer AltUp mechanism (small `per_layer_input_gate` /
-    # `per_layer_projection` / `per_layer_model_projection` modules) computes its
-    # activations in float32 even though Unsloth loads the rest of the model in
-    # float16 on a T4 (no bf16 support). Left as-is, this raises
-    # `RuntimeError: expected mat1 and mat2 to have the same dtype` on the very
-    # first training step. Upcasting just these small modules (not the ~4.7GB
-    # `embed_tokens_per_layer` table, which would OOM a T4) fixes the mismatch
-    # at negligible memory cost (confirmed via forward+backward pass on Colab).
-    for name, module in model.named_modules():
-        if (
-            "per_layer" in name
-            and "embed_tokens_per_layer" not in name
-            and getattr(module, "weight", None) is not None
-            and module.weight.dtype == torch.float16
-        ):
-            module.float()
+    upcast_gemma_per_layer_modules(model)
 
     return model, tokenizer
 

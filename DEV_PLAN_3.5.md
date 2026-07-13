@@ -116,10 +116,10 @@ integration is non-trivial):
   `data/eval/{domain}.jsonl` (reuse the `{domain, document, gold}` shape; can
   share `load_examples` logic with `train.py`). Clear error if the eval set is
   absent (see Dependencies).
-- [ ] **3.5.3** **`Opus`** — Model loading for inference: base and base+adapter
+- [x] **3.5.3** **`Opus`** — Model loading for inference: base and base+adapter
   via Unsloth `FastModel` (`for_inference`), 4-bit. Lazy imports. Verify adapter
   attach path (`from_pretrained(adapter)` vs. `PeftModel`).
-- [ ] **3.5.4** **`Opus`** — Generation, two paths: (a) prompt-only `generate` +
+- [x] **3.5.4** **`Opus`** — Generation, two paths: (a) prompt-only `generate` +
   JSON parse (reuse `strip_json_fence` idea from `generate_data.py`); (b)
   `outlines` schema-constrained. Both reuse `prompt_format`. See decision B
   risks — **fetch current outlines docs via context7 before writing.**
