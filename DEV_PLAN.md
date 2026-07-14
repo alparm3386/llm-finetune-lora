@@ -31,14 +31,14 @@
   (`--smoke` at 60 steps, seeds, resume-from-checkpoint); thin Colab notebook wrapper; unit tests
   for all non-GPU parts (21 passing). See `DEV_PLAN_3.4.md` for the full breakdown. Training
   itself hasn't run yet — no local CUDA GPU — that's step **3.6** on Colab T4.
-- [ ] **3.5** Eval script: before/after comparison of the base vs. fine-tuned adapter, with
+- [x] **3.5** Eval script: before/after comparison of the base vs. fine-tuned adapter, with
   structured decoding (`outlines`) applied to both to isolate the content-accuracy gain (see
   `SCOPE.md`'s structured-decoding-vs-fine-tuning section); per-field exact-match F1 as primary
   metric, JSON validity rate (prompt-only) as secondary; results table written out. Detailed
-  breakdown in [`DEV_PLAN_3.5.md`](DEV_PLAN_3.5.md) (9 sub-steps). Includes **3.5.0**: create the
-  **real hand-labeled eval set** (`data/eval/*.jsonl`) — scaffolding + validator here, labeling is
-  a manual task. This eval-set + the trained adapter (3.6) are the run-time prerequisites, so the
-  full eval run happens within **3.6**.
+  breakdown in [`DEV_PLAN_3.5.md`](DEV_PLAN_3.5.md) (9/9 sub-steps done, 101 passing tests). Includes
+  **3.5.0**: create the **real hand-labeled eval set** (`data/eval/*.jsonl`) — scaffolding +
+  validator here, labeling is a manual task. This eval-set + the trained adapter (3.6) are the
+  run-time prerequisites, so the full eval run happens within **3.6**.
 - [ ] **3.6** Run training on **Colab T4** (Unsloth), save the adapter, record results.
 - [ ] **3.7** Upload the adapter to the **Hugging Face Hub** with a model card (task, base model,
   data, hyperparameters, before/after results, limitations).
