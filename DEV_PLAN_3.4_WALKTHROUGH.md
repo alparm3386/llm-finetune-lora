@@ -330,6 +330,96 @@ you get from ordinary per-token prediction on examples whose targets are
 consistently structured. The schema lives in the *data*; per-token prediction
 absorbs it one nudge at a time.
 
+### Reading the two loss curves: the overfitting monitor
+
+The 5% val split ([station 3](#station-3-first-the-data--the-most-tangible))
+never sets weights — its whole job is to produce one honest number, `eval_loss`,
+logged alongside `train_loss` during training (that's what `eval_strategy="steps"`
++ `eval_steps` at [train.py:261](src/train.py#L261) schedule). Watching the two
+*together* is how you tell **learning** from **memorizing**:
+
+- **`train_loss`** — loss on data the adapter *is* being nudged on. It almost
+  always falls; a falling `train_loss` alone proves nothing.
+- **`eval_loss`** — loss on the held-out val set the model *never* learns from.
+  Because it can't be memorized (no gradients flow from it), it improves *only*
+  if the model got genuinely better at the task. That's the un-cheatable signal.
+
+You read them by how they move **relative to each other**:
+
+| Pattern | Meaning |
+|---|---|
+| both falling together | healthy — really learning |
+| `train_loss` ↓ but `eval_loss` flattens | diminishing returns — near the sweet spot |
+| `train_loss` ↓ but `eval_loss` **rises** | **overfitting** — now memorizing; the ideal stopping point was where `eval_loss` bottomed out |
+
+```
+loss
+ │  \___                 train_loss: keeps sliding down
+ │      \_____________
+ │  \                    eval_loss: bottoms out, then flattens / rises
+ │   \____      ___----
+ │        \____/
+ └──────────────────────→ steps
+             ↑ ideal stop
+```
+
+That divergence — train still improving while eval flattens or turns back up —
+is the classic overfitting signature.
+
+### What the actual 3.6 run showed
+
+The Colab T4 run (step 3.6) went the full **159 steps = 3 epochs** on ~428
+examples, with `eval_loss` logged every 20 steps. Here is the real curve
+(pulled from `checkpoints/checkpoint-159/trainer_state.json` in the run output):
+
+| step | epoch | `eval_loss` | |
+|---|---|---|---|
+| 20 | 0.38 | 0.3179 | |
+| 40 | 0.76 | 0.2415 | |
+| 60 | 1.13 | 0.2288 | |
+| 80 | 1.51 | 0.2134 | |
+| **100** | **1.89** | **0.2074** | ← best |
+| 120 | 2.27 | 0.2087 | |
+| 140 | 2.65 | 0.2087 | |
+| 159 | 3.00 | 0.2081 | flat (+0.0007 vs. best) |
+
+Meanwhile `train_loss` kept gently sliding the whole time — ~0.20 early, ~0.05
+by the end of epoch 1, into the ~0.02–0.03 range through epochs 2–3 (with noisy
+blips, e.g. 0.0576 on the very last step).
+
+This is a **textbook diminishing-returns / mild-overfitting-onset** picture, not
+the dramatic rising-eval version:
+
+- `eval_loss` **bottomed at step 100 (epoch ~1.9) = 0.2074**, then went flat —
+  in fact a hair *worse* by the end (0.2081). It never improved after epoch ~1.9.
+- `train_loss` **kept falling** the whole time. That split — train ↓ while eval
+  flat/↑ — is the signature: the last epoch taught the model to fit the
+  *synthetic training set* better while buying essentially nothing on held-out data.
+- The wins were front-loaded: **~35% of the total eval improvement happened by
+  epoch ~1.9**; the final epoch was near noise-level.
+
+**Practical takeaway:** ~2 epochs would have reached the same eval quality as 3
+here — a candidate to cut a third of the GPU time on any retrain.
+
+**A checkpoint gotcha this run surfaced.** `save_total_limit` keeps only the
+last N checkpoints, so the run retained `checkpoint-140` and `checkpoint-159` —
+but **not** `checkpoint-100`, the one at the `eval_loss` minimum. The
+"recover the earlier, better adapter" move above therefore wasn't fully
+available. It barely mattered *this* time (eval at steps 100/120/140/159 are all
+~0.207–0.209, effectively identical), but to have the sweet-spot adapter kept
+automatically next time, set `load_best_model_at_end=True` +
+`metric_for_best_model="eval_loss"` in the `SFTConfig`
+([train.py:243](src/train.py#L243)) — the trainer then reloads and saves the
+best checkpoint regardless of where it fell.
+
+**One caveat on what this proves.** This `eval_loss` is measured on *synthetic*
+val data (same distribution as training), so it catches "memorizing the
+synthetic examples" — but it does **not** tell you how well the model transfers
+to *real* Hungarian documents. That's a separate safety net: the per-field F1
+on the real, hand-labeled `data/eval/` set (step 3.5). Two distinct questions —
+`eval_loss` asks *"am I overfitting during training?"*, the 3.5 F1 asks *"did
+any of this transfer to the real world?"*
+
 ## The one-sentence summary
 
 **3.4 wires up a 5-stage pipeline — load frozen 4-bit Gemma → attach a tiny LoRA
