@@ -227,8 +227,8 @@ token position it outputs a probability distribution over the whole vocabulary
    scaled by the learning rate (`2e-4`). This is the actual "nudge toward the
    correct output."
 
-Repeat for the next example. 450 examples × 3 epochs ≈ hundreds of thousands of
-these tiny nudges, accumulating into learned behavior.
+Repeat for the next example. ~428 training examples × 3 epochs ≈ hundreds of
+thousands of these tiny nudges, accumulating into learned behavior.
 
 Two refinements specific to this project:
 - **Masking picks which positions count** ([train.py:196](src/train.py#L196),
@@ -317,7 +317,7 @@ Structure emerges anyway, because:
    `serialize_gold()` forces key order
    ([prompt_format.py:34](src/prompt_format.py#L34)) instead of using the
    source JSONL's arbitrary order. The "after `{` comes the first schema key"
-   nudge points the *same direction* across all 430 examples. Repeated,
+   nudge points the *same direction* across all ~428 training examples. Repeated,
    consistent nudges compound into a robust rule; inconsistent ones would
    cancel out.
 

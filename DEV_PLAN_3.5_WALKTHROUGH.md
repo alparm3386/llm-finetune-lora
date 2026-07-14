@@ -11,9 +11,10 @@
 
 ## Part 1: The big picture — what is 3.5, really?
 
-Step 3.4 produced a trained LoRA adapter (well — it will, once 3.6 actually
-runs it on a GPU). A trained adapter is worthless as a *claim* until you can
-answer: **"how much better did fine-tuning actually make the model?"**
+Step 3.4 built the training machinery, and step 3.6 ran it on a Colab T4 —
+so a trained LoRA adapter now exists. But a trained adapter is worthless as a
+*claim* until you can answer: **"how much better did fine-tuning actually make
+the model?"**
 
 Step 3.5 answers that with **one number pair**: F1 score before vs. after
 fine-tuning, on real (not synthetic) Hungarian documents the model has never
@@ -349,17 +350,18 @@ the two "make this faster while I'm iterating" flags.
 Every function above was written and unit-tested on this machine — 101 tests
 pass with **zero GPU dependency** touched (verified by importing `evaluate.py`
 without `torch`/`outlines`/`unsloth` installed and running the full suite).
-But *running* the eval for real needs three things this machine doesn't have:
+But *running* the eval for real still needs three things:
 
 1. **A GPU** — `unsloth`/`outlines`/`torch` model loading and generation only
-   work on CUDA.
-2. **A trained adapter** — the actual output of step 3.6 (not built yet).
-3. **A populated real eval set** — `data/eval/*.jsonl` are still empty; the
-   hand-labeling (per `data/eval/README.md`) is manual work, tracked
-   separately.
+   work on CUDA (so this runs on Colab, not this machine).
+2. **A trained adapter** — ✅ now exists: step 3.6 ran on a Colab T4 and produced
+   the LoRA adapter (saved to Google Drive).
+3. **A populated real eval set** — still the open blocker: `data/eval/*.jsonl`
+   are empty; the hand-labeling (per `data/eval/README.md`) is manual work,
+   tracked separately.
 
-So step 3.5's job was specifically to make sure that when all three of those
-finally exist (on Colab, step 3.6), running
+So step 3.5's job was specifically to make sure that once the adapter exists
+(done) and a labeled eval set is ready, running
 `python src/evaluate.py --adapter outputs/adapter` "just works" and produces a
 trustworthy number — with all the actual thinking (what counts as correct,
 how to keep the comparison fair, how to report it) already done and tested.
@@ -371,5 +373,5 @@ heavily-tested scoring module that treats every field as "retrieve correctly
 or don't hallucinate," fed by a 2×2 of {base, fine-tuned} × {prompt-only,
 schema-constrained decoding} so that the headline number isolates fine-tuning's
 actual content-accuracy gain from mere formatting compliance — all wired,
-tested, and waiting for a GPU, an adapter, and a labeled eval set to produce
-a real result in step 3.6.**
+tested, and (with the adapter now trained in step 3.6) waiting only on a GPU
+and a labeled eval set to produce a real result.**

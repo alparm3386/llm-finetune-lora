@@ -9,8 +9,11 @@ QLoRA fine-tuning of `google/gemma-4-E2B` (Instruct) for Hungarian structured ex
 rationale, dataset design, and success metric are defined in `SCOPE.md` — read it before making
 design decisions; don't duplicate its content into code comments.
 
-Status: work in progress. `train.py` (step 3.4) is implemented but unrun — the actual GPU training
-job is step 3.6 (Colab T4). `evaluate.py` is a stub (`NotImplementedError`) awaiting step 3.5.
+Status: work in progress. `train.py` (step 3.4) is implemented and has been run on a Colab T4
+(step 3.6) — a trained LoRA adapter now exists (saved to Google Drive). `evaluate.py` (step 3.5) is
+fully implemented and unit-tested (101 passing tests), but the *real* before/after eval hasn't been
+run yet: it still needs the trained adapter plus a populated `data/eval/` (hand-labeling is in
+progress — the JSONL files are currently empty).
 
 ## Commands
 
@@ -19,7 +22,7 @@ pip install -r requirements.txt        # local/reproducible deps; on Colab, `pip
 python src/generate_data.py --domain all --n 50   # generate synthetic training data via the local proxy
 python src/generate_data.py --domain medical --n 20 --seed 1  # single domain, custom count/seed
 python src/train.py --smoke            # QLoRA fine-tuning; only runs on a CUDA GPU (Colab T4, step 3.6)
-python src/evaluate.py                 # before/after eval (stub — step 3.5)
+python src/evaluate.py --adapter outputs/adapter   # before/after eval (needs a GPU + populated data/eval/)
 pytest                                 # unit tests for the non-GPU parts (prompt_format.py, train.py data/CLI)
 ```
 
@@ -34,7 +37,7 @@ The proxy must be running locally before invoking the script.
 
 - **`src/schemas.py`** — the single source of truth for the three domain JSON Schemas (medical,
   business, technology), mirroring the tables in `SCOPE.md`. Both `generate_data.py` (validates
-  synthetic gold JSON) and the future `evaluate.py`/structured-decoding step consume `SCHEMAS`
+  synthetic gold JSON) and `evaluate.py`/the structured-decoding step consume `SCHEMAS`
   from here. If a domain schema changes, it only needs to change in this file.
 - **`src/generate_data.py`** — calls a local OpenAI-compatible proxy (serving Claude models) to
   synthesize `{document, gold}` pairs per domain, validates each `gold` against `schemas.py`,
@@ -49,7 +52,7 @@ The proxy must be running locally before invoking the script.
   functions that need them, so the data pipeline and CLI stay importable/testable without a CUDA
   GPU; only actually running training requires one. Target environment: Colab T4
   (`notebooks/train_colab.ipynb`, step 3.6).
-- **`src/evaluate.py`** — will run the before/after comparison. Key design point from `SCOPE.md`:
+- **`src/evaluate.py`** — runs the before/after comparison (implemented; step 3.5). Key design point from `SCOPE.md`:
   structured decoding (via `outlines`) is applied to **both** the base and fine-tuned model during
   eval, so JSON validity is controlled for and the measured metric (per-field exact-match F1) isolates
   fine-tuning's *content*-accuracy gain, not format compliance. A secondary prompt-only (no
