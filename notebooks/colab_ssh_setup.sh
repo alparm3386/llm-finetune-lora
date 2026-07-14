@@ -13,7 +13,10 @@ if [ -z "$NGROK_AUTHTOKEN" ]; then
 fi
 
 echo "==> Registering NVIDIA driver libs for non-interactive shells (SSH logins don't inherit Colab's LD_LIBRARY_PATH)"
-nvidia_lib_dir="$(dirname "$(find / -xdev -name 'libnvidia-ml.so*' 2>/dev/null | grep -v '/stubs/' | head -n1)")"
+# No -xdev: Colab mounts the real driver libs at /usr/lib64-nvidia on their own
+# ext4 device (separate from the root overlayfs), so -xdev would skip past it
+# and only find the useless CUDA-toolkit stub under /usr/local/cuda*/stubs/.
+nvidia_lib_dir="$(dirname "$(find / -name 'libnvidia-ml.so*' 2>/dev/null | grep -v '/stubs/' | head -n1)")"
 if [ -n "$nvidia_lib_dir" ] && [ "$nvidia_lib_dir" != "." ]; then
     echo "$nvidia_lib_dir" > /etc/ld.so.conf.d/nvidia-colab.conf
     ldconfig
