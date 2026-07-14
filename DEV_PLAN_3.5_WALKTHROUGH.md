@@ -104,6 +104,43 @@ why the whole eval loop, aggregation, and CLI were buildable and testable on
 this machine (no GPU) *before* the adapter even exists — the same lesson
 carried over from `train.py`.
 
+### A note on the three data pools (and what "never trained on" means)
+
+A reader coming from `train.py` might reasonably ask: *3.4 already had a
+"validation" split — how is that different from this eval set?* They are
+**three separate pools** with three separate jobs, and it's worth being precise
+about which ones touch the model's weights:
+
+| Pool | Source | Used in | Role | Sets weights? |
+|---|---|---|---|---|
+| train (~95%, ~428 ex) | `data/synthetic/` | 3.4 | gradient updates | ✅ yes |
+| val (~5%, ~22 ex) | `data/synthetic/` | 3.4 | watch `eval_loss` while training | ❌ no |
+| eval / test | `data/eval/` (real, hand-labeled) | 3.5 | the before/after F1 | ❌ no |
+
+Two things this makes concrete:
+
+- **The 3.4 val split is genuinely dropped from the weights.** Those ~22
+  examples never produce a gradient — the final adapter is trained on only
+  ~95% of the synthetic data. Their sole output is the `eval_loss` log line,
+  which is an *honest* overfitting monitor precisely *because* the model never
+  learned from them (a rising `eval_loss` while `train_loss` keeps falling is a
+  real warning, not an artifact). There's a legitimate trade-off here: you
+  *could* fold the 5% back in for a final "train on 100%" run — it's
+  same-distribution synthetic data, so this is honest and common practice — but
+  you'd give up the monitor, and 22 of 450 examples is a marginal (likely
+  noise-level) gain. This project keeps the 5% held out; the visible
+  overfitting curve is worth more than the extra examples.
+
+- **The 3.5 eval set is a different matter entirely — it must never be trained
+  on, at any point, not even in a final "use everything" pass.** It's the
+  *measuring instrument* for the whole project's headline claim. Training on it
+  would make the before/after number meaningless — grading an exam after handing
+  out the answer key. If you ever want real data in *training*, the correct move
+  is to hand-label *more* real documents and keep a still-untouched slice for the
+  benchmark — never to reabsorb the existing eval set. (This is the same
+  independence argument as point ③ above, stated as a rule: the seal on
+  `data/eval/` is permanent.)
+
 ## Part 3: `eval_metrics.py` — the scoring rules, in detail
 
 This is the part worth understanding precisely, because it's the actual
