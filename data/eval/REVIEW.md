@@ -1,6 +1,6 @@
 # Eval set — review sheet
 
-> Human-readable rendering of `data/eval/*.jsonl` for verification. **Not** read by the eval itself — the pipeline always reads the `.jsonl` files. Edit the `.jsonl`, not this sheet, then re-run `python src/validate_eval_set.py` and regenerate this sheet if you like.
+> Human-readable rendering of `data/eval/*.jsonl` for verification. **Not** read by the eval itself — the pipeline always reads the `.jsonl` files. Edit the `.jsonl`, not this sheet, then re-run `python src/validate_eval_set.py` and regenerate with `python scripts/make_review_sheet.py`.
 
 | domain | count |
 |---|---|
