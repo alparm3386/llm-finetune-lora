@@ -1,8 +1,11 @@
-# Connecting to a Colab VM over SSH — notes
+# Connecting to a Colab VM over SSH via ngrok — notes
 
 > Companion to [`colab_ssh_setup.sh`](colab_ssh_setup.sh). Covers the bits that
 > aren't obvious once you're actually connected: GPU driver visibility, and
 > pulling files from Google Drive without going through a notebook cell.
+>
+> For the free Cloudflare Tunnel alternative (no ngrok account needed), see
+> [`COLAB_SSH_CLOUDFLARE_NOTES.md`](COLAB_SSH_CLOUDFLARE_NOTES.md).
 
 ## Connecting
 
