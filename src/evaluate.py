@@ -99,16 +99,16 @@ def load_inference_model(
     max_seq_length: int = MAX_SEQ_LENGTH,
     load_in_4bit: bool = True,
 ) -> tuple[Any, Any]:
-    """Load a model for inference via Unsloth `FastModel`, 4-bit, `for_inference`.
+    """Load a single model for inference via Unsloth `FastModel`, 4-bit, `for_inference`.
 
-    Two callers: the **base** eval (`adapter_dir=None` → load `model_name`
-    straight) and the **fine-tuned** eval (`adapter_dir` set). For the latter we
-    pass the saved adapter directory as `model_name`: `save_adapter` (train.py)
-    wrote the adapter + its `adapter_config.json`, whose `base_model_name_or_path`
-    points Unsloth back at the same base to reload in 4-bit and re-attach the
-    LoRA — the Unsloth-native reload path. (Fallback if that ever fights the
-    quantized stack: load the base via this function with `adapter_dir=None`, then
-    `PeftModel.from_pretrained(model, adapter_dir)`.)
+    `adapter_dir=None` loads the base straight; `adapter_dir` set loads the saved
+    adapter directory as `model_name` (Unsloth reads its `adapter_config.json` /
+    `base_model_name_or_path` to reload the base in 4-bit and re-attach the LoRA).
+    This is a full model load either way — for the base+fine-tuned comparison in
+    `main()`, prefer `load_base_and_finetuned_models` below, which loads the base
+    weights once and attaches the adapter on top instead of loading them twice
+    (two full loads doesn't fit a T4's 15GB alongside Gemma-4's forced float32
+    compute dtype).
 
     Mirrors `train.load_base_model`: lazy `unsloth` import (keeps this module
     GPU-free to import), `dtype=None` auto-detect, and the shared Gemma-4
@@ -128,6 +128,43 @@ def load_inference_model(
     upcast_gemma_per_layer_modules(model)
     FastModel.for_inference(model)  # Unsloth's 2x-faster inference mode
     return model, tokenizer
+
+
+def load_base_and_finetuned_models(
+    model_name: str = DEFAULT_BASE_MODEL,
+    adapter_dir: str = "",
+    max_seq_length: int = MAX_SEQ_LENGTH,
+    load_in_4bit: bool = True,
+) -> tuple[Any, Any, Any]:
+    """Load the base model once, then attach the LoRA adapter on top of it in place.
+
+    Loading base and fine-tuned as two separate `load_inference_model` calls
+    keeps both full 4-bit models resident on the GPU at once — on a T4 (15GB),
+    combined with Gemma-4's forced float32 compute dtype, the second load runs
+    out of VRAM and `transformers` silently offloads modules to CPU, which the
+    bnb 4-bit quantizer then refuses (`ValueError: modules dispatched on CPU`).
+    Attaching the adapter via `PeftModel.from_pretrained` onto the already-loaded
+    base avoids ever holding two full base copies: the adapter itself is tiny.
+
+    Returns `(base_model, fine_tuned_model, tokenizer)` — one shared tokenizer,
+    since both variants use the same base and vocab.
+    """
+    from peft import PeftModel
+    from unsloth import FastModel
+
+    base_model, tokenizer = FastModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        dtype=None,
+        load_in_4bit=load_in_4bit,
+        full_finetuning=False,
+    )
+    upcast_gemma_per_layer_modules(base_model)
+    FastModel.for_inference(base_model)
+
+    fine_tuned_model = PeftModel.from_pretrained(base_model, adapter_dir)
+    FastModel.for_inference(fine_tuned_model)
+    return base_model, fine_tuned_model, tokenizer
 
 
 # --- 3.5.4: generation, two paths ---------------------------------------------
@@ -327,21 +364,37 @@ def run_evaluation(
     Structured generators are built once per model variant (schema-index
     compilation is the expensive part — see `build_structured_generators`), then
     reused across all examples in that variant's structured cell.
+
+    When `base_model`/`fine_tuned_model` come from `load_base_and_finetuned_models`
+    (the shared-base loading path), they're the *same* underlying weights with the
+    LoRA adapter injected in place — `fine_tuned_model` is a `PeftModel` wrapping
+    `base_model`. Generating from `base_model` directly would therefore still hit
+    the adapter (PEFT mutates layers in place, it doesn't copy them), so the
+    `"base"` cell runs inside `fine_tuned_model.disable_adapter()` whenever that's
+    available. This is a no-op for the legacy two-independent-loads path (separate
+    objects, disabling one doesn't touch the other).
     """
+    import contextlib
+
     results: dict[str, dict[str, Any]] = {}
     variants = [
         ("base", base_model, base_tokenizer),
         ("fine_tuned", fine_tuned_model, fine_tuned_tokenizer),
     ]
     for variant_name, model, tokenizer in variants:
-        structured_generators = build_structured_generators(model, tokenizer)
-        results[f"{variant_name}.structured"] = run_eval_cell(
-            model, tokenizer, examples, "structured", structured_generators, max_new_tokens, seed
-        )
-        if not structured_only:
-            results[f"{variant_name}.prompt_only"] = run_eval_cell(
-                model, tokenizer, examples, "prompt_only", None, max_new_tokens, seed
+        if variant_name == "base" and hasattr(fine_tuned_model, "disable_adapter"):
+            adapter_ctx = fine_tuned_model.disable_adapter()
+        else:
+            adapter_ctx = contextlib.nullcontext()
+        with adapter_ctx:
+            structured_generators = build_structured_generators(model, tokenizer)
+            results[f"{variant_name}.structured"] = run_eval_cell(
+                model, tokenizer, examples, "structured", structured_generators, max_new_tokens, seed
             )
+            if not structured_only:
+                results[f"{variant_name}.prompt_only"] = run_eval_cell(
+                    model, tokenizer, examples, "prompt_only", None, max_new_tokens, seed
+                )
     return results
 
 
@@ -529,19 +582,16 @@ def main() -> None:
     examples = apply_limit(load_eval_examples(Path(args.eval_dir)), args.limit)
     logger.info("Loaded %d eval examples from %s", len(examples), args.eval_dir)
 
-    logger.info("Loading base model %s...", args.base_model)
-    base_model, base_tokenizer = load_inference_model(args.base_model)
-
-    logger.info("Loading fine-tuned model (adapter %s)...", args.adapter)
-    fine_tuned_model, fine_tuned_tokenizer = load_inference_model(
-        args.base_model, adapter_dir=args.adapter
+    logger.info("Loading base model %s and attaching adapter %s...", args.base_model, args.adapter)
+    base_model, fine_tuned_model, tokenizer = load_base_and_finetuned_models(
+        args.base_model, args.adapter
     )
 
     results = run_evaluation(
         base_model,
-        base_tokenizer,
+        tokenizer,
         fine_tuned_model,
-        fine_tuned_tokenizer,
+        tokenizer,
         examples,
         max_new_tokens=args.max_new_tokens,
         seed=args.seed,
