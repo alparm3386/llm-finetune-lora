@@ -64,16 +64,34 @@ if ! command -v cloudflared &> /dev/null; then
     chmod +x /usr/local/bin/cloudflared
 fi
 
-echo "==> Starting Quick Tunnel (Ctrl+C to stop)."
-echo "    No account/domain needed. Look for a line like:"
-echo "    https://<random-words>.trycloudflare.com"
+echo "==> Starting Quick Tunnel in the background (survives this terminal tab closing)"
+CF_LOG=/var/log/cloudflared.log
+nohup cloudflared tunnel --url ssh://localhost:22 > "$CF_LOG" 2>&1 < /dev/null &
+disown
+echo "    cloudflared running as PID $!, logging to $CF_LOG"
+
+echo "==> Waiting for the tunnel hostname..."
+CF_HOSTNAME=""
+for _ in $(seq 1 30); do
+    CF_HOSTNAME="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$CF_LOG" | head -n1)"
+    [ -n "$CF_HOSTNAME" ] && break
+    sleep 1
+done
+
+if [ -z "$CF_HOSTNAME" ]; then
+    echo "    Tunnel hostname not found yet after 30s — check $CF_LOG manually (tail -f $CF_LOG)."
+else
+    echo "    $CF_HOSTNAME"
+fi
 echo ""
-echo "    On your laptop, add to ~/.ssh/config:"
+echo "    On your laptop, add to ~/.ssh/config (replace the HostName each time you rerun this script):"
 echo "        Host colab-cloudflare"
-echo "            HostName <random-words>.trycloudflare.com"
+echo "            HostName ${CF_HOSTNAME#https://}"
 echo "            User root"
 echo "            IdentityFile ~/.ssh/colab_tunnel"
 echo "            ProxyCommand cloudflared access ssh --hostname %h"
 echo "    Then: ssh colab-cloudflare"
 echo ""
-cloudflared tunnel --url ssh://localhost:22
+echo "==> Tailing cloudflared log below (Ctrl+C only stops viewing — the tunnel itself keeps running)."
+echo "    To actually stop the tunnel later: pkill cloudflared"
+tail -f "$CF_LOG"
